@@ -306,6 +306,50 @@ class Tests(unittest.TestCase):
             self.assertIsNone(sweep.github_pause(b'Resource not accessible by integration (HTTP 403)', 0))
         run.assert_not_called()
 
+    def test_upload_retries_long_server_failure_with_full_stream_and_backoff(self):
+        attempts, delays = [], []
+        class Response:
+            @property
+            def status(self): return 500 if len(attempts) <= 4 else 201
+            def getheader(self, name): return None
+            def read(self, count): return b'server failure' if self.status == 500 else json.dumps(asset).encode()
+        class Connection:
+            def __init__(self, host, **kw): pass
+            def request(self, method, url, body, headers): attempts.append(body.read())
+            def getresponse(self): return Response()
+            def close(self): pass
+        store = object.__new__(sweep.Store)
+        store.repo, store.tag, store.assets = 'owner/boxes', 'b1', {}
+        store.release = {'id': 1, 'upload_url': 'https://uploads.github.com/repos/owner/boxes/releases/1/assets{?name,label}'}
+        store.refresh = lambda: None
+        with directory() as folder:
+            path = Path(folder) / 'packet.tar'; path.write_bytes(b'whole immutable packet')
+            asset = {'name': path.name, 'id': 2, 'size': path.stat().st_size, 'state': 'uploaded', 'digest': 'sha256:' + sweep.sha(path)}
+            with patch.object(sweep.http.client, 'HTTPSConnection', Connection), patch.dict(os.environ, {'GH_TOKEN': 'fake-token'}), patch.object(sweep.time, 'sleep', side_effect=delays.append):
+                saved = store.upload(path)
+            self.assertEqual(attempts, [path.read_bytes()] * 5)
+            self.assertEqual(saved['sha256'], sweep.sha(path))
+            self.assertTrue(all(actual >= minimum for actual, minimum in zip(delays, [15, 30, 60, 120])))
+
+    def test_upload_permission_denial_stops_without_retry(self):
+        class Response:
+            status = 403
+            def getheader(self, name): return None
+            def read(self, count): return b'Resource not accessible by integration'
+        class Connection:
+            def __init__(self, host, **kw): pass
+            def request(self, *a, **kw): pass
+            def getresponse(self): return Response()
+            def close(self): pass
+        store = object.__new__(sweep.Store)
+        store.repo, store.tag, store.assets = 'owner/boxes', 'b1', {}
+        store.release = {'id': 1, 'upload_url': 'https://uploads.github.com/repos/owner/boxes/releases/1/assets{?name,label}'}
+        with directory() as folder:
+            path = Path(folder) / 'packet.tar'; path.write_bytes(b'archive')
+            with patch.object(sweep.http.client, 'HTTPSConnection', Connection), patch.dict(os.environ, {'GH_TOKEN': 'fake-token'}), patch.object(sweep.time, 'sleep') as wait:
+                with self.assertRaises(ValueError): store.upload(path)
+                wait.assert_not_called()
+
     def test_resume_fetches_only_missing_records_and_publishes_complete_inventory(self):
         data = plan(2)
         restored, _ = record(data['records'][0])

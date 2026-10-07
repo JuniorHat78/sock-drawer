@@ -13,6 +13,7 @@ import io
 import json
 import math
 import os
+import random
 from pathlib import Path
 import re
 import subprocess
@@ -300,7 +301,7 @@ class Store:
             token = os.environ.get('GH_TOKEN', '')
             if not token:
                 raise ValueError('Upload requires the repository token')
-            for attempt in range(4):
+            for attempt in range(8):
                 wait = 0
                 connection = http.client.HTTPSConnection('uploads.github.com', timeout=600)
                 try:
@@ -320,15 +321,21 @@ class Store:
                     if status == 201:
                         asset = json.loads(raw)
                         break
+                    transient = status in (408, 429, 500, 502, 503, 504) or (
+                        status == 403 and (response.getheader('X-RateLimit-Remaining') == '0' or b'rate limit' in raw.lower()))
+                    if status not in (409, 422) and not transient:
+                        raise ValueError(f'Asset upload HTTP {status}')
                     raise RuntimeError(f'Asset upload HTTP {status}')
                 except (RuntimeError, OSError, http.client.HTTPException):
                     self.refresh()
                     asset = self.assets.get(path.name)
                     if asset:
                         break
-                    if attempt == 3:
+                    if attempt == 7:
                         raise
-                    time.sleep(max(2 ** (attempt + 1), wait))
+                    # Large uploads need enough time to outlast a server fault.
+                    # Jitter keeps several workers from retrying in lockstep.
+                    time.sleep(max(min(180, 15 * 2**attempt) + random.uniform(0, 5), wait))
                 finally:
                     connection.close()
         if asset is None or asset['state'] != 'uploaded' or asset['size'] != path.stat().st_size:
