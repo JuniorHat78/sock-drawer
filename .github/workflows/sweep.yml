@@ -1,0 +1,95 @@
+name: Sweep
+run-name: "Sweep ${{ inputs.tag }}"
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Manifest release tag
+        required: true
+        type: string
+      sha256:
+        description: Manifest SHA256
+        required: true
+        type: string
+      allow_fetch:
+        description: Fetch missing files
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sweep
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  GH_TOKEN: ${{ github.token }}
+  REPO: ${{ github.repository }}
+  TAG: ${{ inputs.tag }}
+  PLAN_SHA: ${{ inputs.sha256 }}
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    outputs:
+      matrix: ${{ steps.queue.outputs.matrix }}
+      parallel: ${{ steps.queue.outputs.parallel }}
+      count: ${{ steps.queue.outputs.count }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - run: python -B -m unittest -v test_sweep
+      - name: Read list
+        run: |
+          mkdir -p input
+          gh release download "$TAG" --repo "$REPO" --pattern manifest.json --dir input
+      - name: Queue
+        id: queue
+        run: python -B sweep.py prepare --manifest input/manifest.json --sha256 "$PLAN_SHA" --repo "$REPO" --tag "$TAG" --out out
+
+  collect:
+    needs: prepare
+    if: ${{ inputs.allow_fetch && needs.prepare.outputs.count != '0' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+    strategy:
+      fail-fast: false
+      max-parallel: ${{ fromJSON(needs.prepare.outputs.parallel) }}
+      matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - name: Read list
+        run: |
+          mkdir -p input
+          gh release download "$TAG" --repo "$REPO" --pattern manifest.json --dir input
+      - name: Fill boxes
+        env:
+          CHUNK: ${{ matrix.shard }}
+        run: python -B sweep.py fetch --manifest input/manifest.json --sha256 "$PLAN_SHA" --repo "$REPO" --tag "$TAG" --shard "$CHUNK" --out out
+
+  summary:
+    needs: [prepare, collect]
+    if: ${{ always() && needs.prepare.result == 'success' && (inputs.allow_fetch || needs.prepare.outputs.count == '0') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - name: Read list
+        run: |
+          mkdir -p input
+          gh release download "$TAG" --repo "$REPO" --pattern manifest.json --dir input
+      - name: Count boxes
+        run: python -B sweep.py aggregate --manifest input/manifest.json --sha256 "$PLAN_SHA" --repo "$REPO" --tag "$TAG" --out out
