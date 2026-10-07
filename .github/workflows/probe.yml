@@ -22,6 +22,26 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 360
     steps:
+      - name: Prepare workspace
+        timeout-minutes: 8
+        run: |
+          python3 - <<'PY'
+          import json, os, shutil, subprocess
+          workspace = os.environ['RUNNER_TEMP']
+          before = shutil.disk_usage(workspace).free
+          attempted = 0
+          if os.environ.get('RUNNER_ENVIRONMENT') == 'github-hosted' and before < 32 * 1024**3:
+              for directory in ('/usr/local/lib/android', '/usr/share/dotnet', '/opt/ghc'):
+                  if not os.path.isdir(directory): continue
+                  attempted += 1
+                  try:
+                      subprocess.run(['sudo', 'rm', '-rf', '--', directory], check=False,
+                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=120)
+                  except subprocess.TimeoutExpired:
+                      pass
+          print(json.dumps({'free_bytes_before': before, 'free_bytes_after': shutil.disk_usage(workspace).free,
+                            'sdk_cleanup_attempts': attempted}))
+          PY
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           persist-credentials: false
