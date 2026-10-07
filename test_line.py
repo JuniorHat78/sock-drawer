@@ -61,5 +61,11 @@ class LineTests(unittest.TestCase):
         state['requests']['1']['attempts'] = 3
         self.assertFalse(line.retry_dispatch(state, 1, {'tag': 'b'}, [], now))
 
+    def test_unconfirmed_dispatch_gets_a_visibility_grace_period(self):
+        now = dt.datetime(2026, 10, 7, 18, tzinfo=dt.timezone.utc)
+        state = {'requests': {'1': {'attempts': 1, 'requested_utc': (now - dt.timedelta(seconds=60)).isoformat()}}}
+        self.assertEqual(line.recovery_action(state, 1, {'tag': 'b'}, [], now), 'wait')
+        self.assertEqual(line.recovery_action(state, 1, {'tag': 'b'}, [], now + dt.timedelta(seconds=65)), 'dispatch')
+
 
 if __name__ == '__main__': unittest.main()

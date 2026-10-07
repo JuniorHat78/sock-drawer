@@ -39,6 +39,14 @@ def retry_dispatch(state, index, step, runs, now):
     return True
 
 
+def recovery_action(state, index, step, runs, now):
+    if retry_dispatch(state, index, step, runs, now): return 'dispatch'
+    saved = state.get('requests', {}).get(str(index))
+    if saved and (now - dt.datetime.fromisoformat(saved['requested_utc'])).total_seconds() < 120:
+        return 'wait'
+    return 'step_needs_attention'
+
+
 def run(args):
     source = sweep.Store(args.repo, args.tag)
     config = source.json_asset('line.json')
@@ -84,9 +92,7 @@ def run(args):
         if report: receipts[step['tag']] = report
     action, index = next_step(steps, receipts, active)
     if action == 'dispatch' and index in state['dispatched']:
-        if not retry_dispatch(state, index, steps[index], runs, dt.datetime.now(dt.timezone.utc)):
-            # Preserve unfinished snapshots; do not repeat a failed private program.
-            action = 'step_needs_attention'
+        action = recovery_action(state, index, steps[index], runs, dt.datetime.now(dt.timezone.utc))
     state.update(action=action, index=index, active=active, checked_utc=sweep.now())
     inputs = None
     if action == 'dispatch':
