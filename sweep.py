@@ -211,6 +211,8 @@ def ordered_results(function, items, lanes):
 
 def github_pause(stderr, attempt):
     message = stderr.decode(errors='replace').lower()
+    if re.search(r'http (?:500|502|503|504)\b|connection reset|tls handshake timeout', message):
+        return min(60, 2 ** (attempt + 1))
     if 'rate limit' not in message and 'http 429' not in message:
         return None
     probe = subprocess.run(['gh', 'api', 'rate_limit'], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
@@ -274,7 +276,12 @@ class Store:
             values = json.loads(gh(['api', f'repos/{self.repo}/releases/{self.release["id"]}/assets?per_page=100&page={page}']))
             for asset in values:
                 if asset['name'] in self.assets:
-                    raise ValueError('Duplicate remote asset name')
+                    prior = self.assets[asset['name']]
+                    # Insertions move an identical asset across page boundaries.
+                    # Distinct IDs or changed content still fail validation.
+                    if any(prior.get(k) != asset.get(k) for k in ('id', 'size', 'digest', 'state')):
+                        raise ValueError('Conflicting remote asset name')
+                    continue
                 self.assets[asset['name']] = asset
             if len(values) < 100:
                 return
@@ -712,9 +719,22 @@ def aggregate(args, plan):
         raise RuntimeError('Collection incomplete; retry the unfinished chunks')
 
 
+def retrieve(args):
+    if not re.fullmatch(r'[0-9a-f]{64}', args.sha256):
+        raise ValueError('Invalid manifest digest')
+    store = Store(args.repo, args.tag)
+    asset = store.assets.get('manifest.json')
+    if not asset or asset.get('digest') != 'sha256:' + args.sha256 or asset['size'] > MAX_BYTES:
+        raise ValueError('Remote manifest identity differs')
+    args.manifest.parent.mkdir(parents=True, exist_ok=True)
+    gh_download(args.repo, asset['id'], args.manifest)
+    read_plan(args.manifest, args.sha256)
+    print(json.dumps({'manifest_verified': True, 'bytes': asset['size']}))
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('mode', choices=('prepare', 'fetch', 'aggregate'))
+    parser.add_argument('mode', choices=('retrieve', 'prepare', 'fetch', 'aggregate'))
     parser.add_argument('--manifest', type=Path, required=True)
     parser.add_argument('--sha256', required=True)
     parser.add_argument('--repo', required=True)
@@ -726,6 +746,9 @@ def main():
     parser.add_argument('--lanes', type=int, default=1)
     args = parser.parse_args()
     identity(args.repo, args.tag)
+    if args.mode == 'retrieve':
+        retrieve(args)
+        return
     plan = read_plan(args.manifest, args.sha256)
     args.out.mkdir(parents=True, exist_ok=True)
     globals()[args.mode](args, plan)

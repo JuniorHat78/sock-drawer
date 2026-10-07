@@ -64,9 +64,7 @@ jobs:
           persist-credentials: false
       - run: python -B -m unittest -v test_sweep
       - name: Read list
-        run: |
-          mkdir -p input
-          gh release download "$TAG" --repo "$REPO" --pattern manifest.json --dir input
+        run: python -B sweep.py retrieve --manifest input/manifest.json --sha256 "$PLAN_SHA" --repo "$REPO" --tag "$TAG" --out out
       - name: Queue
         id: queue
         run: python -B sweep.py prepare --manifest input/manifest.json --sha256 "$PLAN_SHA" --repo "$REPO" --tag "$TAG" --out out --parallel "$PARALLEL" --rpm "$RPM" --lanes "$LANES"
@@ -85,9 +83,7 @@ jobs:
         with:
           persist-credentials: false
       - name: Read list
-        run: |
-          mkdir -p input
-          gh release download "$TAG" --repo "$REPO" --pattern manifest.json --dir input
+        run: python -B sweep.py retrieve --manifest input/manifest.json --sha256 "$PLAN_SHA" --repo "$REPO" --tag "$TAG" --out out
       - name: Fill boxes
         env:
           CHUNK: ${{ matrix.shard }}
@@ -103,8 +99,6 @@ jobs:
         with:
           persist-credentials: false
       - name: Read list
-        run: |
-          mkdir -p input
-          gh release download "$TAG" --repo "$REPO" --pattern manifest.json --dir input
+        run: python -B sweep.py retrieve --manifest input/manifest.json --sha256 "$PLAN_SHA" --repo "$REPO" --tag "$TAG" --out out
       - name: Count boxes
         run: python -B sweep.py aggregate --manifest input/manifest.json --sha256 "$PLAN_SHA" --repo "$REPO" --tag "$TAG" --out out

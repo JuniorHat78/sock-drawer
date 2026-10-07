@@ -49,6 +49,25 @@ def record(item, raw=b'original\x00\xff' * 100):
 
 
 class Tests(unittest.TestCase):
+    def test_live_asset_pagination_deduplicates_same_id_only(self):
+        def asset(index):
+            return {'id': index, 'name': f'box-{index}', 'size': 12, 'digest': 'sha256:abc', 'state': 'uploaded'}
+        page_one = [asset(i) for i in range(100)]
+        page_two = [asset(i) for i in range(99, 115)]
+        store = object.__new__(sweep.Store)
+        store.repo = 'owner/repo'; store.release = {'id': 1}
+        with patch.object(sweep, 'gh', side_effect=[json.dumps(page_one), json.dumps(page_two)]):
+            store.refresh()
+        self.assertEqual(len(store.assets), 115)
+        conflict = {**page_two[0], 'id': 9999}
+        with patch.object(sweep, 'gh', side_effect=[json.dumps(page_one), json.dumps([conflict])]):
+            with self.assertRaises(ValueError): store.refresh()
+
+    def test_transient_asset_server_failures_are_retried_without_auth_retry(self):
+        self.assertEqual(sweep.github_pause(b'HTTP 500 (temporary)', 0), 2)
+        self.assertEqual(sweep.github_pause(b'HTTP 503 (temporary)', 2), 8)
+        self.assertIsNone(sweep.github_pause(b'HTTP 403 forbidden', 0))
+
     def test_manifest_rejects_duplicates_and_unsafe_sources(self):
         for change in ('duplicate', 'retained', 'http', 'userinfo', 'host', 'slash', 'traversal', 'budget'):
             data = plan(2)
