@@ -57,6 +57,26 @@ class Boxes(unittest.TestCase):
             with self.assertRaises(RuntimeError): mill.probe(args)
             launch.assert_not_called()
 
+    def test_probe_inputs_bind_plaintext_to_the_sealed_receipt(self):
+        raw = self.root / 'source.tar'; raw.write_bytes(b'checked archive content')
+        box = self.root / 'input.box'; mill.seal(raw, box, self.key)
+        saved = {'name': box.name, 'tag': 'revision', 'bytes': box.stat().st_size,
+                 'sha256': sweep.sha(box), 'plain_sha256': sweep.sha(raw)}
+        args = SimpleNamespace(repo='owner/repo', out=self.root)
+        with patch.object(mill, 'download', return_value=box):
+            folder = mill.probe_inputs({'inputs': [saved]}, args, self.key)
+        self.assertEqual((folder / 'input-000.tar').read_bytes(), raw.read_bytes())
+        mill.seal(raw, box, self.key)
+        saved['plain_sha256'] = '0' * 64
+        with patch.object(mill, 'download', return_value=box):
+            with self.assertRaises(ValueError): mill.probe_inputs({'inputs': [saved]}, args, self.key)
+        self.assertFalse((folder / 'input-000.tar').exists())
+
+    def test_probe_inputs_have_bounded_disk_and_package_counts(self):
+        args = SimpleNamespace(repo='owner/repo', out=self.root)
+        with self.assertRaises(ValueError): mill.probe_inputs({'inputs': [{}] * 65}, args, self.key)
+        with self.assertRaises(ValueError): mill.probe_inputs({'inputs': [{'bytes': 17 * 1024**3}]}, args, self.key)
+
     def test_tamper_never_commits_plaintext(self):
         raw = self.root / 'raw'; raw.write_bytes(b'checked content' * 100)
         box, decoded = self.root / 'a.box', self.root / 'decoded'

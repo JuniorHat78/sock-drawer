@@ -505,6 +505,30 @@ def summary(args):
             raise RuntimeError('Offline output coverage is incomplete')
 
 
+def probe_inputs(bundle, args, key):
+    attachments = bundle.get('inputs', [])
+    if not isinstance(attachments, list) or len(attachments) > 64:
+        raise ValueError('Unsupported input count')
+    if sum(item['bytes'] for item in attachments) > 16 * 1024**3:
+        raise ValueError('Inputs exceed the total size budget')
+    input_dir = args.out / 'inputs'
+    for index, item in enumerate(attachments):
+        if (not re.fullmatch(r'[0-9a-f]{64}', item['plain_sha256'])
+                or not re.fullmatch(r'[0-9a-f]{64}', item['sha256'])
+                or not 0 < item['bytes'] < MAX_BOX + 36):
+            raise ValueError('Invalid sealed input identity')
+        source = PublicSource(args.repo, item['tag'], args.out / 'metadata')
+        packed = download(source, item, args.out / 'attachments')
+        input_dir.mkdir(exist_ok=True)
+        decoded = input_dir / f'input-{index:03d}.tar'
+        unseal(packed, decoded, key)
+        if sweep.sha(decoded) != item['plain_sha256']:
+            decoded.unlink()
+            raise ValueError('Input plaintext differs from its receipt')
+        packed.unlink()
+    return input_dir if attachments else None
+
+
 def probe(args):
     """One bounded CPU experiment; its program and diagnostics stay sealed."""
     control = PublicSource(args.repo, args.tag, args.out / 'metadata')
@@ -531,17 +555,23 @@ def probe(args):
     result_dir = args.out / 'private'; result_dir.mkdir()
     success = False
     try:
+        input_dir = probe_inputs(bundle, args, key)
+        limit = bundle.get('seconds', 1800)
+        if type(limit) is not int or not 30 <= limit <= 18000:
+            raise ValueError('Unsupported experiment time budget')
         with (result_dir / 'setup.log').open('wb') as log:
             setup = subprocess.run([sys.executable, '-m', 'pip', 'install', '--disable-pip-version-check',
                 '-r', str(runtime / bundle['requirements'])], stdout=log, stderr=subprocess.STDOUT,
                 env=child_environment(), timeout=600)
         if setup.returncode == 0:
+            command = [sys.executable, str(runtime / bundle['entry']), '--output', str(result_dir.resolve())]
+            if input_dir is not None:
+                command.extend(['--inputs', str(input_dir.resolve())])
             with (result_dir / 'experiment.log').open('wb') as log:
-                process = subprocess.run([sys.executable, str(runtime / bundle['entry']),
-                    '--output', str(result_dir.resolve())], stdout=log, stderr=subprocess.STDOUT,
-                    env=child_environment(), timeout=1800)
+                process = subprocess.run(command, stdout=log, stderr=subprocess.STDOUT,
+                    env=child_environment(), timeout=limit)
             success = process.returncode == 0
-    except (subprocess.TimeoutExpired, OSError) as error:
+    except (subprocess.TimeoutExpired, OSError, ValueError) as error:
         (result_dir / 'failure.log').write_text(type(error).__name__ + ': ' + str(error), encoding='utf-8')
     archive_path = args.out / 'probe-result.tar.gz'
     with tarfile.open(archive_path, 'w:gz', compresslevel=6) as archive:
