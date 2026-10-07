@@ -562,13 +562,36 @@ def probe_archive(result_dir, archive_path):
                     archive.addfile(info, source)
 
 
+def probe_resources(pid, result_dir):
+    """Numeric capacity telemetry for this owned child; no command lines or paths."""
+    def counters(path, names):
+        values = {}
+        try:
+            for line in path.read_text(encoding='ascii', errors='replace').splitlines():
+                name, _, value = line.partition(':')
+                if name in names: values[name] = int(value.split()[0]) * 1024
+        except (OSError, ValueError, IndexError): pass
+        return values
+    child = counters(Path('/proc') / str(pid) / 'status', ('VmRSS', 'VmHWM'))
+    memory = counters(Path('/proc/meminfo'), ('MemAvailable',))
+    return {'schema': 'box-probe-resources-1', 'checked_utc': sweep.now(),
+            'child_rss_bytes': child.get('VmRSS'), 'child_peak_rss_bytes': child.get('VmHWM'),
+            'memory_available_bytes': memory.get('MemAvailable'),
+            'workspace_free_bytes': shutil.disk_usage(result_dir).free}
+
+
 def probe_process(command, runtime, result_dir, store, key, limit, bundle_sha):
     began = time.monotonic(); last_snapshot = began; index = 0
+    last_resource = began - 60
     with (result_dir / 'experiment.log').open('wb') as log:
         process = subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT, env=child_environment())
         try:
             while process.poll() is None:
                 elapsed = time.monotonic() - began
+                if time.monotonic() - last_resource >= 60:
+                    try: sweep.save(result_dir / 'resources.json', probe_resources(process.pid, result_dir))
+                    except OSError: pass
+                    last_resource = time.monotonic()
                 if elapsed > limit:
                     raise subprocess.TimeoutExpired(command, limit)
                 if time.monotonic() - last_snapshot >= 900:
