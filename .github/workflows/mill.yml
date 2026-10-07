@@ -4,6 +4,11 @@ run-name: "Mill ${{ inputs.phase || 'full' }}"
 on:
   workflow_dispatch:
     inputs:
+      tag:
+        description: Sealed queue release
+        required: true
+        default: c20261007r2
+        type: string
       phase:
         description: Queue phase
         required: true
@@ -29,7 +34,7 @@ defaults:
 env:
   GH_TOKEN: ${{ github.token }}
   REPO: ${{ github.repository }}
-  TAG: c20261007
+  TAG: ${{ inputs.tag || 'c20261007r2' }}
   PHASE: ${{ inputs.phase || 'full' }}
   OPENBLAS_NUM_THREADS: 1
   OMP_NUM_THREADS: 1
