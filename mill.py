@@ -309,9 +309,10 @@ def prepare(args):
             if prior is None: finished = False
             else: receipt_ok(output_stores[tag], prior, output_identity(config, item, package))
         if not finished: queued.append(task['shard'])
-    emit(matrix={'shard': queued or [0]}, count=len(queued), parallel=item['parallel'])
+    capacity = 37 if args.phase == 'full' and complete and complete.get('complete') else item['parallel']
+    emit(matrix={'shard': queued or [0]}, count=len(queued), parallel=capacity)
     print(json.dumps({'queued_chunks': len(queued), 'planned_chunks': len(tasks), 'records': count,
-                      'parallel': item['parallel'], 'incremental': args.phase == 'full'}))
+                      'parallel': capacity, 'incremental': args.phase == 'full'}))
 
 
 def receipt_ok(store, prior, expected):
@@ -529,6 +530,68 @@ def probe_inputs(bundle, args, key):
     return input_dir if attachments else None
 
 
+def probe_resume(bundle, args, key):
+    item = bundle.get('resume')
+    if item is None: return None
+    source = PublicSource(args.repo, item['tag'], args.out / 'metadata')
+    report = source.json_asset('probe-receipt.json')
+    if report is None:
+        inventory = sweep.Store(args.repo, item['tag'])
+        names = sorted(a['name'] for a in inventory.assets.values() if re.fullmatch(r'snapshot-[0-9-]+\.json', a['name']))
+        report = source.json_asset(names[-1]) if names else None
+    if not report or report.get('bundle_sha256') != item['bundle_sha256'] or len(report['outputs']) != 1:
+        raise ValueError('Resume has no matching checked checkpoint')
+    saved = report['outputs'][0]
+    packed = download(source, saved, args.out / 'resume')
+    decoded = args.out / 'resume.tar.gz'; unseal(packed, decoded, key)
+    if sweep.sha(decoded) != saved['plain_sha256']:
+        decoded.unlink(); raise ValueError('Resume plaintext differs')
+    packed.unlink()
+    return decoded
+
+
+def probe_archive(result_dir, archive_path):
+    with tarfile.open(archive_path, 'w:gz', compresslevel=1) as archive:
+        for path in sorted(result_dir.rglob('*')):
+            if path.is_file() and not path.name.endswith(('.partial', '.part')):
+                if path.is_symlink() or not path.resolve().is_relative_to(result_dir.resolve()):
+                    raise ValueError('Unsafe probe output')
+                with path.open('rb') as source:
+                    info = archive.gettarinfo(str(path), arcname=path.relative_to(result_dir).as_posix(), fileobj=source)
+                    archive.addfile(info, source)
+
+
+def probe_process(command, runtime, result_dir, store, key, limit, bundle_sha):
+    began = time.monotonic(); last_snapshot = began; index = 0
+    with (result_dir / 'experiment.log').open('wb') as log:
+        process = subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT, env=child_environment())
+        try:
+            while process.poll() is None:
+                elapsed = time.monotonic() - began
+                if elapsed > limit:
+                    raise subprocess.TimeoutExpired(command, limit)
+                if time.monotonic() - last_snapshot >= 900:
+                    prefix = f'snapshot-{sweep.run_id()}-{index:03d}'
+                    archive = result_dir.parent / (prefix + '.tar.gz')
+                    probe_archive(result_dir, archive)
+                    box = result_dir.parent / (prefix + '.box')
+                    saved = sealed_upload(store, archive, box, key)
+                    saved.update(plain_sha256=sweep.sha(archive), tag=store.tag)
+                    report = {'schema': 'box-snapshot-1', 'bundle_sha256': bundle_sha,
+                              'seconds': elapsed, 'outputs': [saved]}
+                    receipt = result_dir.parent / (prefix + '.json'); sweep.save(receipt, report); store.upload(receipt)
+                    archive.unlink(); box.unlink(); receipt.unlink()
+                    index += 1; last_snapshot = time.monotonic()
+                    print(json.dumps({'sealed_snapshot': index, 'elapsed_seconds': round(elapsed)}), flush=True)
+                time.sleep(2)
+            return process.returncode == 0
+        finally:
+            if process.poll() is None:
+                process.terminate()
+                try: process.wait(timeout=20)
+                except subprocess.TimeoutExpired: process.kill(); process.wait(timeout=20)
+
+
 def probe(args):
     """One bounded CPU experiment; its program and diagnostics stay sealed."""
     control = PublicSource(args.repo, args.tag, args.out / 'metadata')
@@ -556,8 +619,9 @@ def probe(args):
     success = False
     try:
         input_dir = probe_inputs(bundle, args, key)
+        resume = probe_resume(bundle, args, key)
         limit = bundle.get('seconds', 1800)
-        if type(limit) is not int or not 30 <= limit <= 18000:
+        if type(limit) is not int or not 30 <= limit <= 19800:
             raise ValueError('Unsupported experiment time budget')
         with (result_dir / 'setup.log').open('wb') as log:
             setup = subprocess.run([sys.executable, '-m', 'pip', 'install', '--disable-pip-version-check',
@@ -567,19 +631,13 @@ def probe(args):
             command = [sys.executable, str(runtime / bundle['entry']), '--output', str(result_dir.resolve())]
             if input_dir is not None:
                 command.extend(['--inputs', str(input_dir.resolve())])
-            with (result_dir / 'experiment.log').open('wb') as log:
-                process = subprocess.run(command, stdout=log, stderr=subprocess.STDOUT,
-                    env=child_environment(), timeout=limit)
-            success = process.returncode == 0
-    except (subprocess.TimeoutExpired, OSError, ValueError) as error:
+            if resume is not None:
+                command.extend(['--resume', str(resume.resolve())])
+            success = probe_process(command, runtime, result_dir, store, key, limit, config['bundle']['sha256'])
+    except (subprocess.TimeoutExpired, OSError, ValueError, RuntimeError) as error:
         (result_dir / 'failure.log').write_text(type(error).__name__ + ': ' + str(error), encoding='utf-8')
     archive_path = args.out / 'probe-result.tar.gz'
-    with tarfile.open(archive_path, 'w:gz', compresslevel=6) as archive:
-        for path in sorted(result_dir.rglob('*')):
-            if path.is_file():
-                if path.is_symlink() or not path.resolve().is_relative_to(result_dir.resolve()):
-                    raise ValueError('Unsafe probe output')
-                archive.add(path, arcname=path.relative_to(result_dir).as_posix(), recursive=False)
+    probe_archive(result_dir, archive_path)
     sealed = args.out / 'probe-result.box'
     saved = sealed_upload(store, archive_path, sealed, key)
     saved.update(plain_sha256=sweep.sha(archive_path), tag=args.tag)

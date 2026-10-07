@@ -13,8 +13,8 @@ class Decisions(unittest.TestCase):
         self.assertEqual(self.choose(active={'Sweep': [1], 'Mill': [2], 'Probe': []}), 'wait')
         self.assertEqual(self.choose(active={'Sweep': [1], 'Mill': [], 'Probe': []}), 'cpu')
 
-    def test_one_experiment_blocks_new_cpu_batches(self):
-        self.assertEqual(self.choose(raw_done=True, active={'Sweep': [], 'Mill': [], 'Probe': [3]}), 'wait')
+    def test_one_experiment_can_share_the_reserved_runner_with_cpu_batches(self):
+        self.assertEqual(self.choose(raw_done=True, active={'Sweep': [], 'Mill': [], 'Probe': [3]}), 'cpu')
 
     def test_unexpected_record_errors_are_not_retried(self):
         self.assertEqual(self.choose(raw_done=True, failed=1, previous_failed=True), 'cpu_needs_attention')

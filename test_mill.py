@@ -77,6 +77,23 @@ class Boxes(unittest.TestCase):
         with self.assertRaises(ValueError): mill.probe_inputs({'inputs': [{}] * 65}, args, self.key)
         with self.assertRaises(ValueError): mill.probe_inputs({'inputs': [{'bytes': 17 * 1024**3}]}, args, self.key)
 
+    def test_live_snapshot_excludes_incomplete_files_and_keeps_complete_checkpoint(self):
+        folder = self.root / 'private'; folder.mkdir()
+        (folder / 'latest.pt').write_bytes(b'complete model state')
+        (folder / 'latest.pt.partial').write_bytes(b'incomplete replacement')
+        archive = self.root / 'snapshot.tar.gz'
+        mill.probe_archive(folder, archive)
+        with tarfile.open(archive) as stored:
+            self.assertEqual(stored.getnames(), ['latest.pt'])
+            self.assertEqual(stored.extractfile('latest.pt').read(), b'complete model state')
+
+    def test_resume_rejects_checkpoint_from_another_program(self):
+        args = SimpleNamespace(repo='owner/repo', out=self.root)
+        source = SimpleNamespace(json_asset=lambda name: {'bundle_sha256': 'different', 'outputs': []})
+        with patch.object(mill, 'PublicSource', return_value=source), patch.object(mill, 'download') as fetch:
+            with self.assertRaises(ValueError): mill.probe_resume({'resume': {'tag': 'old', 'bundle_sha256': 'expected'}}, args, self.key)
+            fetch.assert_not_called()
+
     def test_tamper_never_commits_plaintext(self):
         raw = self.root / 'raw'; raw.write_bytes(b'checked content' * 100)
         box, decoded = self.root / 'a.box', self.root / 'decoded'

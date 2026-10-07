@@ -13,7 +13,7 @@ def decision(state, active, raw_done, chunks, ready, cpu_done, failed, previous_
     if not raw_done and not active['Sweep']:
         if state.get('source_retries', 0) >= 3: return 'source_needs_attention'
         return 'source'
-    if not ready or cpu_done or active['Mill'] or active['Probe']: return 'wait'
+    if not ready or cpu_done or active['Mill']: return 'wait'
     if failed: return 'cpu_needs_attention'
     if chunks > state.get('cpu_last_chunks', 0): return 'cpu'
     if previous_failed:
