@@ -5,6 +5,7 @@ import hashlib
 import json
 from pathlib import Path
 import subprocess
+import time
 
 import mill
 import sweep
@@ -42,7 +43,7 @@ def run(args):
     source = sweep.Store(args.repo, args.tag)
     config = source.json_asset('line.json')
     if config is None:
-        print(json.dumps({'line_ready': False})); return
+        print(json.dumps({'line_ready': False})); return {'finished': True, 'action': 'not_ready'}
     if config.get('schema') != 'box-line-1' or config.get('repo') != args.repo:
         raise ValueError('Unsupported sealed line')
     steps = config['steps']
@@ -58,7 +59,7 @@ def run(args):
     state = source.json_asset('line-state.json') or {'schema': 'box-line-state-1', 'identity': identity, 'dispatched': []}
     if state['identity'] != identity: raise ValueError('Line configuration changed')
     if state.get('finished'):
-        print(json.dumps({'finished': True, 'action': state['action']})); return
+        print(json.dumps({'finished': True, 'action': state['action']})); return state
     runs = json.loads(sweep.gh(['api', f'repos/{args.repo}/actions/workflows/probe.yml/runs?per_page=30']))['workflow_runs']
     active = [r['id'] for r in runs if r['head_branch'] == 'main' and r['status'] != 'completed']
     receipts = {}
@@ -105,10 +106,38 @@ def run(args):
     if state.get('finished'):
         sweep.gh(['api', '--method', 'PUT', f'repos/{args.repo}/actions/workflows/line.yml/disable'])
     print(json.dumps(state), flush=True)
+    return state
+
+
+def wake(args):
+    workflow = json.loads(sweep.gh(['api', f'repos/{args.repo}/actions/workflows/line.yml']))
+    if workflow['state'] != 'active':
+        print(json.dumps({'controller_wake': False, 'reason': 'disabled'})); return
+    path = args.out / 'wake.json'; sweep.save(path, {'ref': 'main'})
+    sweep.gh(['api', '--method', 'POST', f'repos/{args.repo}/actions/workflows/line.yml/dispatches', '--input', str(path)])
+    print(json.dumps({'controller_wake': True}), flush=True)
+
+
+def watch(args):
+    if not 60 <= args.watch_seconds <= 19500: raise ValueError('Unsupported watch budget')
+    deadline = time.monotonic() + args.watch_seconds
+    while True:
+        state = run(args)
+        if state.get('finished'): return
+        remaining = deadline - time.monotonic()
+        if remaining <= 60:
+            # The replacement waits behind this workflow's concurrency group.
+            wake(args); return
+        time.sleep(min(60, remaining))
 
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--repo', required=True); parser.add_argument('--tag', required=True)
     parser.add_argument('--out', type=Path, required=True)
-    args = parser.parse_args(); args.out.mkdir(parents=True, exist_ok=True); run(args)
+    parser.add_argument('--watch-seconds', type=int, default=0)
+    parser.add_argument('--wake', action='store_true')
+    args = parser.parse_args(); args.out.mkdir(parents=True, exist_ok=True)
+    if args.wake: wake(args)
+    elif args.watch_seconds: watch(args)
+    else: run(args)

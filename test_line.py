@@ -1,9 +1,23 @@
 import unittest
 import datetime as dt
+from types import SimpleNamespace
+from unittest.mock import patch
 import line
 
 
 class LineTests(unittest.TestCase):
+    def test_watch_rolls_over_before_runner_deadline(self):
+        args = SimpleNamespace(watch_seconds=180)
+        with patch.object(line, 'run', return_value={'finished': False}), patch.object(line, 'wake') as wake:
+            with patch.object(line.time, 'monotonic', side_effect=[0, 121]): line.watch(args)
+        wake.assert_called_once_with(args)
+
+    def test_watch_stops_when_the_frozen_queue_finishes(self):
+        args = SimpleNamespace(watch_seconds=180)
+        with patch.object(line, 'run', side_effect=[{'finished': False}, {'finished': True}]), patch.object(line.time, 'sleep') as sleep:
+            with patch.object(line.time, 'monotonic', side_effect=[0, 20]): line.watch(args)
+        sleep.assert_called_once_with(60)
+
     def test_no_parallel_steps(self):
         self.assertEqual(line.next_step([{'tag': 'a', 'sha256': 'x'}], {}, [4]), ('wait', None))
 
