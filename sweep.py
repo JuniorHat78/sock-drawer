@@ -586,6 +586,8 @@ def run_id():
 
 
 def aggregate(args, plan):
+    control = Store(args.repo, args.tag)
+    prior = control.json_asset('summary.json')
     stores, records, packages, missing_chunks = {}, [], [], []
     for shard in range(math.ceil(len(plan['records']) / 512)):
         tag = wave(args.tag, shard)
@@ -611,9 +613,16 @@ def aggregate(args, plan):
               'retained_elsewhere_ids': plan['retained_ids'], 'missing_ids': missing,
               'missing_chunks': missing_chunks, 'packages': packages,
               'stored_bytes': sum(p['bytes'] for p in packages), 'completed_utc': now()}
+    if prior is not None:
+        if (not complete or prior.get('schema') != SCHEMA or prior.get('complete') is not True
+                or prior.get('plan_sha256') != args.sha256
+                or any(prior.get(k) != result[k] for k in result if k != 'completed_utc')):
+            raise ValueError('Completed inventory differs from verified checkpoints')
+        print(json.dumps({'reused_inventory': True, 'collected_records': len(records)}), flush=True)
+        return
     path = args.out / ('summary.json' if complete else 'incomplete-' + run_id() + '.json')
     save(path, result)
-    Store(args.repo, args.tag).upload(path)
+    control.upload(path)
     print(json.dumps({k:v for k,v in result.items() if k not in ('packages', 'missing_ids', 'retained_elsewhere_ids')}), flush=True)
     if not complete:
         raise RuntimeError('Collection incomplete; retry the unfinished chunks')

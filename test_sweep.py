@@ -297,6 +297,31 @@ class Tests(unittest.TestCase):
         self.assertEqual(saved[0]['collected_ids'], [])
         self.assertEqual(saved[0]['failures'][0]['id'], 1)
 
+    def test_completed_aggregate_rerun_reuses_immutable_inventory(self):
+        data = plan()
+        row, _ = record(data['records'][0])
+        package = {'name': 'chunk-000-part-000.tar', 'id': 2, 'bytes': 1000,
+                   'sha256': 'a' * 64, 'ids': [1], 'tag': 'b1-w00'}
+        chunk = {'schema': sweep.SCHEMA, 'plan_sha256': 'a' * 64, 'shard': 0,
+                 'assigned_ids': [1], 'collected_ids': [1], 'records': [row], 'packages': [package]}
+        summary = {'schema': sweep.SCHEMA, 'plan_sha256': 'a' * 64, 'complete': True,
+                   'queued_records': 1, 'collected_records': 1, 'retained_elsewhere_ids': [900000],
+                   'missing_ids': [], 'missing_chunks': [], 'packages': [package], 'stored_bytes': 1000,
+                   'completed_utc': 'original timestamp'}
+        class FakeStore:
+            def json_asset(self, name):
+                return summary if name == 'summary.json' else chunk
+            def check_package(self, receipt): pass
+            def upload(self, path):
+                self_test.fail('Completed inventory must not be rewritten on retry')
+        self_test = self
+        with directory() as folder:
+            args = SimpleNamespace(repo='owner/boxes', tag='b1', sha256='a' * 64, out=Path(folder))
+            with patch.object(sweep, 'Store', return_value=FakeStore()):
+                sweep.aggregate(args, data)
+                summary['stored_bytes'] += 1
+                with self.assertRaises(ValueError): sweep.aggregate(args, data)
+
 
 if __name__ == '__main__':
     unittest.main()
