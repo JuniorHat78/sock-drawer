@@ -1,0 +1,99 @@
+name: Mill
+run-name: "Mill ${{ inputs.phase || 'full' }}"
+
+on:
+  workflow_dispatch:
+    inputs:
+      phase:
+        description: Queue phase
+        required: true
+        default: pilot
+        type: choice
+        options: [pilot, full]
+  workflow_run:
+    workflows: [Sweep]
+    branches: [main]
+    types: [completed]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: mill
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  GH_TOKEN: ${{ github.token }}
+  REPO: ${{ github.repository }}
+  TAG: c20261007
+  PHASE: ${{ inputs.phase || 'full' }}
+  OPENBLAS_NUM_THREADS: 1
+  OMP_NUM_THREADS: 1
+
+jobs:
+  prepare:
+    if: ${{ github.ref == 'refs/heads/main' && (github.event_name == 'workflow_dispatch' || (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.head_repository.full_name == github.repository)) }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    outputs:
+      matrix: ${{ steps.queue.outputs.matrix }}
+      count: ${{ steps.queue.outputs.count }}
+      parallel: ${{ steps.queue.outputs.parallel }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+          ref: main
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - run: python -m pip install --disable-pip-version-check cryptography==42.0.8
+      - run: python -B -m unittest -v test_mill
+      - name: Queue
+        id: queue
+        run: python -B mill.py prepare --repo "$REPO" --tag "$TAG" --phase "$PHASE" --out out
+
+  process:
+    needs: prepare
+    if: ${{ needs.prepare.outputs.count != '0' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 330
+    strategy:
+      fail-fast: false
+      max-parallel: ${{ fromJSON(needs.prepare.outputs.parallel) }}
+      matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+          ref: main
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - run: python -m pip install --disable-pip-version-check cryptography==42.0.8
+      - name: Process boxes
+        env:
+          BOX_KEY: ${{ secrets.BOX_KEY }}
+          CHUNK: ${{ matrix.shard }}
+        run: python -B mill.py work --repo "$REPO" --tag "$TAG" --phase "$PHASE" --shard "$CHUNK" --out out
+
+  summary:
+    needs: [prepare, process]
+    if: ${{ always() && needs.prepare.result == 'success' && needs.prepare.outputs.count != '0' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+          ref: main
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - run: python -m pip install --disable-pip-version-check cryptography==42.0.8
+      - name: Count boxes
+        run: python -B mill.py summary --repo "$REPO" --tag "$TAG" --phase "$PHASE" --out out
