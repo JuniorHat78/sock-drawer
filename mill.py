@@ -505,12 +505,68 @@ def summary(args):
             raise RuntimeError('Offline output coverage is incomplete')
 
 
+def probe(args):
+    """One bounded CPU experiment; its program and diagnostics stay sealed."""
+    control = PublicSource(args.repo, args.tag, args.out / 'metadata')
+    config = control.json_asset('probe.json')
+    if not config or config.get('schema') != 'box-probe-1' or config.get('repo') != args.repo:
+        raise ValueError('Unsupported probe identity')
+    store = store_at(args.repo, args.tag)
+    prior = store.json_asset('probe-receipt.json')
+    if prior is not None:
+        if prior.get('bundle_sha256') != config['bundle']['sha256']:
+            raise ValueError('Prior probe belongs to another toolbox')
+        for saved in prior['outputs']:
+            asset = store.assets.get(saved['name'])
+            if not asset or asset['size'] != saved['bytes'] or asset.get('digest') != 'sha256:' + saved['sha256']:
+                raise ValueError('Prior probe output differs')
+        if prior['success'] is not True:
+            raise RuntimeError('Prior probe has preserved unresolved failures')
+        print(json.dumps({'probe_complete': True, 'reused': True})); return
+    started = time.perf_counter()
+    key = key_bytes()
+    parcel = download(control, config['bundle'], args.out / 'parcel')
+    plain = args.out / 'toolbox.tar.gz'; unseal(parcel, plain, key)
+    runtime = args.out / 'toolbox'; bundle = safe_extract(plain, runtime); plain.unlink()
+    result_dir = args.out / 'private'; result_dir.mkdir()
+    success = False
+    try:
+        with (result_dir / 'setup.log').open('wb') as log:
+            setup = subprocess.run([sys.executable, '-m', 'pip', 'install', '--disable-pip-version-check',
+                '-r', str(runtime / bundle['requirements'])], stdout=log, stderr=subprocess.STDOUT,
+                env=child_environment(), timeout=600)
+        if setup.returncode == 0:
+            with (result_dir / 'experiment.log').open('wb') as log:
+                process = subprocess.run([sys.executable, str(runtime / bundle['entry']),
+                    '--output', str(result_dir.resolve())], stdout=log, stderr=subprocess.STDOUT,
+                    env=child_environment(), timeout=1800)
+            success = process.returncode == 0
+    except (subprocess.TimeoutExpired, OSError) as error:
+        (result_dir / 'failure.log').write_text(type(error).__name__ + ': ' + str(error), encoding='utf-8')
+    archive_path = args.out / 'probe-result.tar.gz'
+    with tarfile.open(archive_path, 'w:gz', compresslevel=6) as archive:
+        for path in sorted(result_dir.rglob('*')):
+            if path.is_file():
+                if path.is_symlink() or not path.resolve().is_relative_to(result_dir.resolve()):
+                    raise ValueError('Unsafe probe output')
+                archive.add(path, arcname=path.relative_to(result_dir).as_posix(), recursive=False)
+    sealed = args.out / 'probe-result.box'
+    saved = sealed_upload(store, archive_path, sealed, key)
+    saved.update(plain_sha256=sweep.sha(archive_path), tag=args.tag)
+    receipt = {'schema': 'box-probe-output-1', 'bundle_sha256': config['bundle']['sha256'],
+               'success': success, 'outputs': [saved], 'cpus': min(4, os.cpu_count() or 1),
+               'seconds': time.perf_counter() - started}
+    sweep.save(args.out / 'probe-receipt.json', receipt); store.upload(args.out / 'probe-receipt.json')
+    print(json.dumps({'probe_complete': success, 'seconds': receipt['seconds']}), flush=True)
+    if not success: raise RuntimeError('Probe has sealed diagnostic failures')
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('mode', choices=('prepare', 'work', 'summary'))
+    parser.add_argument('mode', choices=('prepare', 'work', 'summary', 'probe'))
     parser.add_argument('--repo', required=True)
     parser.add_argument('--tag', required=True)
-    parser.add_argument('--phase', choices=('pilot', 'full'), required=True)
+    parser.add_argument('--phase', choices=('pilot', 'full'), default='pilot')
     parser.add_argument('--shard', type=int, default=0)
     parser.add_argument('--out', type=Path, required=True)
     args = parser.parse_args(); args.out.mkdir(parents=True, exist_ok=True)

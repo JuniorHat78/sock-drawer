@@ -7,6 +7,7 @@ import tarfile
 import unittest
 from unittest.mock import patch
 import uuid
+from types import SimpleNamespace
 
 from cryptography.exceptions import InvalidTag
 import mill
@@ -31,6 +32,30 @@ class Boxes(unittest.TestCase):
         self.assertNotEqual(first.read_bytes(), second.read_bytes())
         mill.unseal(first, decoded, self.key)
         self.assertEqual(sweep.sha(raw), sweep.sha(decoded))
+
+    def test_completed_probe_checks_digest_without_repeating_work(self):
+        saved = {'name': 'probe-result.box', 'bytes': 42, 'sha256': 'a' * 64}
+        receipt = {'bundle_sha256': 'b' * 64, 'success': True, 'outputs': [saved]}
+        store = SimpleNamespace(json_asset=lambda name: receipt,
+            assets={saved['name']: {'size': 42, 'digest': 'sha256:' + 'a' * 64}})
+        control = SimpleNamespace(json_asset=lambda name: {'schema': 'box-probe-1', 'repo': 'owner/repo',
+            'bundle': {'sha256': 'b' * 64}})
+        args = SimpleNamespace(repo='owner/repo', tag='revision', out=self.root)
+        with patch.object(mill, 'PublicSource', return_value=control), patch.object(mill, 'store_at', return_value=store), patch.object(mill.subprocess, 'run') as launch:
+            mill.probe(args)
+            launch.assert_not_called()
+            store.assets[saved['name']]['digest'] = 'sha256:' + 'c' * 64
+            with self.assertRaises(ValueError): mill.probe(args)
+
+    def test_failed_probe_is_preserved_without_blind_retry(self):
+        receipt = {'bundle_sha256': 'b' * 64, 'success': False, 'outputs': []}
+        store = SimpleNamespace(json_asset=lambda name: receipt, assets={})
+        control = SimpleNamespace(json_asset=lambda name: {'schema': 'box-probe-1', 'repo': 'owner/repo',
+            'bundle': {'sha256': 'b' * 64}})
+        args = SimpleNamespace(repo='owner/repo', tag='revision', out=self.root)
+        with patch.object(mill, 'PublicSource', return_value=control), patch.object(mill, 'store_at', return_value=store), patch.object(mill.subprocess, 'run') as launch:
+            with self.assertRaises(RuntimeError): mill.probe(args)
+            launch.assert_not_called()
 
     def test_tamper_never_commits_plaintext(self):
         raw = self.root / 'raw'; raw.write_bytes(b'checked content' * 100)
