@@ -121,8 +121,17 @@ def wake(args):
 def watch(args):
     if not 60 <= args.watch_seconds <= 19500: raise ValueError('Unsupported watch budget')
     deadline = time.monotonic() + args.watch_seconds
+    errors = 0
     while True:
-        state = run(args)
+        try:
+            state = run(args)
+            errors = 0
+        except (RuntimeError, OSError, json.JSONDecodeError) as error:
+            errors += 1
+            print(json.dumps({'controller_retry': errors, 'type': type(error).__name__}), flush=True)
+            if errors >= 3: raise
+            time.sleep(60)
+            continue
         if state.get('finished'): return
         remaining = deadline - time.monotonic()
         if remaining <= 60:

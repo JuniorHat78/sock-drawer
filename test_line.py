@@ -18,6 +18,13 @@ class LineTests(unittest.TestCase):
             with patch.object(line.time, 'monotonic', side_effect=[0, 20]): line.watch(args)
         sleep.assert_called_once_with(60)
 
+    def test_watch_retries_transient_errors_but_stops_after_three(self):
+        args = SimpleNamespace(watch_seconds=180)
+        with patch.object(line, 'run', side_effect=RuntimeError('temporary')), patch.object(line.time, 'sleep') as sleep:
+            with patch.object(line.time, 'monotonic', return_value=0):
+                with self.assertRaises(RuntimeError): line.watch(args)
+        self.assertEqual(sleep.call_count, 2)
+
     def test_no_parallel_steps(self):
         self.assertEqual(line.next_step([{'tag': 'a', 'sha256': 'x'}], {}, [4]), ('wait', None))
 
