@@ -94,6 +94,61 @@ class Boxes(unittest.TestCase):
         Store.assets['a.box']['digest'] = 'sha256:other'
         with self.assertRaises(ValueError): mill.receipt_ok(Store(), report, {'source_sha256': 'expected'})
 
+    def test_incremental_source_requires_frozen_attributes_and_unique_coverage(self):
+        row = {'id': 7, 'attributes': {'at': 123}, 'files': [{'name': 'payload.gz'}]}
+        saved = {'id': 7, 'attributes': row['attributes'], 'source_files': row['files']}
+        task = {'shard': 0, 'expected_ids': [7], 'expected_identity_sha256': mill.source_identity([row])}
+        report = {'schema': sweep.SCHEMA, 'plan_sha256': 'plan', 'shard': 0, 'assigned_ids': [7],
+                  'collected_ids': [7], 'records': [saved], 'packages': [{'ids': [7]}], 'failures': []}
+        class Store:
+            def json_asset(self, name): return report
+            def check_package(self, package): pass
+        self.assertEqual(mill.chunk_packages(Store(), task, 'plan'), report['packages'])
+        report['records'][0] = {**saved, 'attributes': {'at': 999}}
+        with self.assertRaises(ValueError): mill.chunk_packages(Store(), task, 'plan')
+        report['records'][0] = saved; report['packages'].append({'ids': [7]})
+        with self.assertRaises(ValueError): mill.chunk_packages(Store(), task, 'plan')
+
+    def test_incremental_source_can_wait_without_fabricating_packages(self):
+        class Store:
+            def json_asset(self, name): return None
+        self.assertIsNone(mill.chunk_packages(Store(), {'shard': 12}, 'plan'))
+
+    def test_carrier_preserves_every_compressed_part(self):
+        parts = []
+        for index in range(3):
+            path = self.root / f'data-{index}.tar.gz'; path.write_bytes(os.urandom(1000 + index))
+            parts.append({'name': path.name, 'bytes': path.stat().st_size, 'sha256': sweep.sha(path)})
+        outputs = mill.carriers(self.root, parts)
+        self.assertEqual(len(outputs), 1)
+        with tarfile.open(self.root / outputs[0]['name']) as archive:
+            manifest = json.load(archive.extractfile('index.json'))
+            self.assertEqual(manifest['parts'], parts)
+            for part in parts:
+                self.assertEqual(sweep.digest(archive.extractfile(part['name']).read()), part['sha256'])
+        (self.root / parts[0]['name']).write_bytes(b'changed')
+        with self.assertRaises(ValueError): mill.carriers(self.root, parts)
+
+    def test_public_download_never_sends_api_credentials(self):
+        class Response(io.BytesIO):
+            def geturl(self): return 'https://release-assets.githubusercontent.com/checked'
+        requests = []
+        def open_url(request, timeout):
+            requests.append(request)
+            return Response(b'checked')
+        with patch.object(mill, 'urlopen', side_effect=open_url), patch.dict(os.environ, {'GH_TOKEN': 'private'}):
+            path = self.root / 'file'
+            mill.public_file('owner/repo', 'tag', 'asset', path)
+        self.assertEqual(path.read_bytes(), b'checked')
+        self.assertNotIn('authorization', {k.lower() for k in requests[0].headers})
+
+    def test_public_download_enforces_the_frozen_size_budget(self):
+        class Response(io.BytesIO):
+            def geturl(self): return 'https://release-assets.githubusercontent.com/checked'
+        with patch.object(mill, 'urlopen', return_value=Response(b'too much')):
+            with self.assertRaises(ValueError):
+                mill.public_file('owner/repo', 'tag', 'asset', self.root / 'file', max_bytes=2)
+
 
 if __name__ == '__main__':
     unittest.main()

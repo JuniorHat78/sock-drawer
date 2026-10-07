@@ -13,6 +13,9 @@ import subprocess
 import sys
 import tarfile
 import time
+from urllib.error import HTTPError, URLError
+from urllib.parse import quote
+from urllib.request import Request, urlopen
 
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 import sweep
@@ -20,6 +23,66 @@ import sweep
 MAGIC = b'SDRBOX1\n'
 AAD = b'sock-drawer/offline-box/v1'
 MAX_BOX = 1536 * 1024**2
+
+
+def public_file(repo, tag, name, destination, optional=False, max_bytes=2 * 1024**3):
+    sweep.identity(repo, tag)
+    if Path(name).name != name: raise ValueError('Unsafe public asset name')
+    url = f'https://github.com/{repo}/releases/download/{quote(tag, safe="")}/{quote(name, safe="")}'
+    for attempt in range(6):
+        try:
+            # Public release downloads need no API token or authenticated API call.
+            with urlopen(Request(url, headers={'User-Agent': 'sealed-boxes/1'}), timeout=180) as response:
+                sweep.https_url(response.geturl())
+                with destination.open('wb') as out:
+                    written = 0
+                    while block := response.read(1024 * 1024):
+                        written += len(block)
+                        if written > max_bytes: raise ValueError('Public asset exceeds size budget')
+                        out.write(block)
+            return True
+        except HTTPError as error:
+            if optional and error.code == 404: return False
+            if error.code not in (429, 500, 502, 503, 504) or attempt == 5: raise
+            delay = sweep.retry_seconds(error.headers.get('Retry-After'), attempt)
+            time.sleep(max(2 ** (attempt + 1), delay))
+        except (URLError, TimeoutError, OSError):
+            if attempt == 5: raise
+            time.sleep(min(60, 2 ** (attempt + 1)))
+
+
+class PublicSource:
+    def __init__(self, repo, tag, scratch, assets=None):
+        sweep.identity(repo, tag)
+        self.repo, self.tag, self.scratch = repo, tag, scratch
+        self.assets = assets or {}
+
+    def json_asset(self, name):
+        import uuid
+        self.scratch.mkdir(parents=True, exist_ok=True)
+        path = self.scratch / (uuid.uuid4().hex + '.json')
+        try:
+            if not public_file(self.repo, self.tag, name, path, optional=True, max_bytes=sweep.MAX_BYTES): return None
+            if path.stat().st_size > sweep.MAX_BYTES: raise ValueError('Public JSON exceeds budget')
+            return json.loads(path.read_text(encoding='utf-8'))
+        finally:
+            if path.exists(): path.unlink()
+
+    def check_package(self, saved):
+        if (saved['tag'] != self.tag or type(saved['id']) is not int or saved['id'] <= 0
+                or Path(saved['name']).name != saved['name'] or not re.fullmatch(r'[0-9a-f]{64}', saved['sha256'])
+                or not 0 < saved['bytes'] < 2 * 1024**3):
+            raise ValueError('Invalid public checkpoint identity')
+
+
+class OutputStore(sweep.Store):
+    def __init__(self, repo, tag, release_id):
+        sweep.identity(repo, tag)
+        if type(release_id) is not int or release_id <= 0: raise ValueError('Invalid output release ID')
+        self.repo, self.tag = repo, tag
+        self.release = {'id': release_id,
+            'upload_url': f'https://uploads.github.com/repos/{repo}/releases/{release_id}/assets{{?name,label}}'}
+        self.refresh()
 
 
 def key_bytes():
@@ -112,14 +175,15 @@ def download(store, saved, folder):
     name = saved['name']
     if Path(name).name != name:
         raise ValueError('Invalid asset name')
-    asset = store.assets.get(name)
-    if (not asset or asset['id'] != saved['id'] or asset['size'] != saved['bytes']
-            or asset.get('digest') != 'sha256:' + saved['sha256']):
-        raise ValueError('Asset differs from frozen receipt')
+    if not isinstance(store, PublicSource):
+        asset = store.assets.get(name)
+        if (not asset or asset['id'] != saved['id'] or asset['size'] != saved['bytes']
+                or asset.get('digest') != 'sha256:' + saved['sha256']):
+            raise ValueError('Asset differs from frozen receipt')
     folder.mkdir(parents=True, exist_ok=True)
     path = folder / name
-    sweep.gh_download(store.repo, asset['id'], path)
-    if sweep.sha(path) != saved['sha256']:
+    public_file(store.repo, store.tag, name, path, max_bytes=saved['bytes'])
+    if path.stat().st_size != saved['bytes'] or sweep.sha(path) != saved['sha256']:
         raise ValueError('Downloaded asset digest differs')
     return path
 
@@ -137,7 +201,7 @@ def store_at(repo, tag):
 
 
 def queue_config(args):
-    control = sweep.Store(args.repo, args.tag)
+    control = PublicSource(args.repo, args.tag, args.out / 'metadata')
     config = control.json_asset('queue.json')
     if not config or config['schema'] != 'box-queue-1' or config['repo'] != args.repo:
         raise ValueError('Unsupported queue identity')
@@ -156,6 +220,35 @@ def emit(**values):
                 out.write(name + '=' + json.dumps(value, separators=(',', ':')) + '\n')
 
 
+def source_identity(rows, saved=False):
+    values = [{'id': r['id'], 'attributes': r['attributes'],
+               'files': r['source_files'] if saved else r['files']} for r in sorted(rows, key=lambda r: r['id'])]
+    return sweep.digest(json.dumps(values, sort_keys=True, separators=(',', ':')).encode())
+
+
+def chunk_packages(store, task, plan_sha):
+    if 'packages' in task:
+        return task['packages']
+    report = store.json_asset(f"chunk-{task['shard']:03d}-summary.json")
+    if report is None: return None
+    if (report.get('schema') != sweep.SCHEMA or report['plan_sha256'] != plan_sha
+            or report['shard'] != task['shard'] or report['assigned_ids'] != task['expected_ids']
+            or report.get('failures') or report['collected_ids'] != [r['id'] for r in report['records']]
+            or source_identity(report['records'], saved=True) != task['expected_identity_sha256']):
+        raise ValueError('Source chunk differs from frozen task identity')
+    ids = []
+    for package in report['packages']:
+        store.check_package(package); ids.extend(package['ids'])
+    if len(ids) != len(set(ids)) or set(ids) != set(task['expected_ids']):
+        raise ValueError('Source package coverage differs')
+    return report['packages']
+
+
+def output_identity(config, item, package):
+    return {'schema': 'box-output-1', 'bundle_sha256': config['bundle']['sha256'],
+            'source_sha256': package['sha256'], 'plan_sha256': item['plan_sha256'], 'source_ids': package['ids']}
+
+
 def prepare(args):
     control, config = queue_config(args)
     item = config[args.phase]
@@ -166,7 +259,7 @@ def prepare(args):
             print(json.dumps({'enabled': False})); return
     source = sweep.Store(args.repo, item['source_tag'])
     complete = source.json_asset('summary.json')
-    if not complete or complete['complete'] is not True or complete['plan_sha256'] != item['plan_sha256']:
+    if args.phase == 'pilot' and (not complete or complete['complete'] is not True or complete['plan_sha256'] != item['plan_sha256']):
         emit(matrix={'shard': [0]}, count=0, parallel=1)
         print(json.dumps({'source_ready': False})); return
     raw = source.assets['manifest.json']
@@ -176,24 +269,49 @@ def prepare(args):
     stores, tasks = {}, []
     for shard in range(math.ceil(len(plan['records']) / 512)):
         tag = sweep.wave(item['source_tag'], shard)
-        if tag not in stores: stores[tag] = sweep.Store(args.repo, tag)
-        summary = sweep.read_summary(stores[tag], shard, plan, item['plan_sha256'])
-        if summary is None: raise ValueError('Missing checked source chunk')
-        tasks.append({'shard': shard, 'packages': summary['packages']})
-    count = sum(len(p['ids']) for t in tasks for p in t['packages'])
-    if count != len(plan['records']) or count != complete['collected_records']:
+        if tag not in stores:
+            stores[tag] = (sweep.Store(args.repo, tag) if args.phase == 'pilot'
+                           else PublicSource(args.repo, tag, args.out / 'metadata'))
+        if args.phase == 'pilot':
+            summary = sweep.read_summary(stores[tag], shard, plan, item['plan_sha256'])
+            if summary is None: raise ValueError('Missing checked source chunk')
+            tasks.append({'shard': shard, 'packages': summary['packages']})
+        else:
+            expected = sweep.assigned(plan, shard)
+            tasks.append({'shard': shard, 'source_tag': tag, 'expected_ids': [r['id'] for r in expected],
+                          'expected_identity_sha256': source_identity(expected)})
+    count = len(plan['records'])
+    if args.phase == 'pilot' and count != complete['collected_records']:
         raise ValueError('Queue coverage differs from complete source')
     output = store_at(args.repo, item['output_tag'])
-    frozen = {'schema': 'box-tasks-1', 'bundle': config['bundle'], 'phase': args.phase,
+    destinations = {}
+    for wave in range(math.ceil(len(tasks) / 16)):
+        tag = f"{item['output_tag']}-w{wave:02d}"
+        destinations[tag] = store_at(args.repo, tag).release['id']
+    frozen = {'schema': 'box-tasks-1' if args.phase == 'pilot' else 'box-tasks-2', 'bundle': config['bundle'], 'phase': args.phase,
               'plan_sha256': item['plan_sha256'], 'records': count, 'tasks': tasks}
+    if args.phase == 'full': frozen['destinations'] = destinations
     prior = output.json_asset('tasks.json')
     if prior is not None and prior != frozen:
         raise ValueError('Existing tasks belong to another source/toolbox')
     sweep.save(args.out / 'tasks.json', frozen); output.upload(args.out / 'tasks.json')
-    for wave in range(math.ceil(len(tasks) / 16)):
-        store_at(args.repo, f"{item['output_tag']}-w{wave:02d}")
-    emit(matrix={'shard': [t['shard'] for t in tasks]}, count=len(tasks), parallel=item['parallel'])
-    print(json.dumps({'queued_chunks': len(tasks), 'records': count, 'parallel': item['parallel']}))
+    output_stores, queued = {}, []
+    for task in tasks:
+        packages = task.get('packages')
+        if packages is None:
+            packages = chunk_packages(stores[task['source_tag']], task, item['plan_sha256'])
+        if packages is None: continue
+        tag = f"{item['output_tag']}-w{task['shard'] // 16:02d}"
+        if tag not in output_stores: output_stores[tag] = sweep.Store(args.repo, tag)
+        finished = True
+        for package in packages:
+            prior = output_stores[tag].json_asset(package['name'][:-4] + '-receipt.json')
+            if prior is None: finished = False
+            else: receipt_ok(output_stores[tag], prior, output_identity(config, item, package))
+        if not finished: queued.append(task['shard'])
+    emit(matrix={'shard': queued or [0]}, count=len(queued), parallel=item['parallel'])
+    print(json.dumps({'queued_chunks': len(queued), 'planned_chunks': len(tasks), 'records': count,
+                      'parallel': item['parallel'], 'incremental': args.phase == 'full'}))
 
 
 def receipt_ok(store, prior, expected):
@@ -226,15 +344,45 @@ def sealed_upload(store, raw, sealed, key):
     return store.upload(sealed)
 
 
+def carriers(destination, files):
+    """Group small compressed parts into bounded transport files without recoding."""
+    groups, group, size = [], [], 0
+    for saved in files:
+        raw = destination / saved['name']
+        if Path(saved['name']).name != saved['name'] or sweep.sha(raw) != saved['sha256'] or raw.stat().st_size != saved['bytes']:
+            raise ValueError('Output part differs from private receipt')
+        if group and size + saved['bytes'] > 1200 * 1024**2:
+            groups.append(group); group, size = [], 0
+        group.append(saved); size += saved['bytes']
+    if group: groups.append(group)
+    outputs = []
+    for index, group in enumerate(groups):
+        path = destination / f'carrier-{index:02d}.tar'
+        with tarfile.open(path, 'w:') as archive:
+            manifest = json.dumps({'schema': 'box-carrier-1', 'parts': group}, sort_keys=True).encode()
+            import io
+            header = tarfile.TarInfo('index.json'); header.size = len(manifest)
+            archive.addfile(header, io.BytesIO(manifest))
+            for saved in group:
+                archive.add(destination / saved['name'], arcname=saved['name'], recursive=False)
+        outputs.append({'name': path.name, 'bytes': path.stat().st_size, 'sha256': sweep.sha(path)})
+    return outputs
+
+
 def work(args):
     control, config = queue_config(args)
     item = config[args.phase]
-    tasks = sweep.Store(args.repo, item['output_tag']).json_asset('tasks.json')
+    tasks = PublicSource(args.repo, item['output_tag'], args.out / 'metadata').json_asset('tasks.json')
     if (tasks['bundle'] != config['bundle'] or tasks['plan_sha256'] != item['plan_sha256']
             or tasks['phase'] != args.phase):
         raise ValueError('Task set differs from queue')
     assigned = [t for t in tasks['tasks'] if t['shard'] == args.shard]
     if len(assigned) != 1: raise ValueError('Unassigned chunk')
+    assigned = assigned[0]
+    packages = assigned.get('packages')
+    if packages is None:
+        packages = chunk_packages(PublicSource(args.repo, assigned['source_tag'], args.out / 'metadata'), assigned, item['plan_sha256'])
+    if packages is None: raise ValueError('Assigned source chunk is not ready')
     key = key_bytes()
     parcel = download(control, config['bundle'], args.out / 'parcel')
     unpacked = args.out / 'toolbox.tar.gz'
@@ -247,19 +395,19 @@ def work(args):
             '-r', str(runtime / bundle['requirements'])], stdout=out, stderr=subprocess.STDOUT,
             env=child_environment(), timeout=600)
     if result.returncode: raise RuntimeError('Toolbox dependency setup failed')
-    output = sweep.Store(args.repo, f"{item['output_tag']}-w{args.shard // 16:02d}")
+    tag = f"{item['output_tag']}-w{args.shard // 16:02d}"
+    output = (OutputStore(args.repo, tag, tasks['destinations'][tag]) if 'destinations' in tasks
+              else sweep.Store(args.repo, tag))
     total = {'records': 0, 'accepted': 0, 'quarantined': 0, 'failed': 0, 'rows': 0, 'entries': 0}
-    for package in assigned[0]['packages']:
+    for package in packages:
         prefix = package['name'][:-4]
-        expected = {'schema': 'box-output-1', 'bundle_sha256': config['bundle']['sha256'],
-                    'source_sha256': package['sha256'], 'plan_sha256': item['plan_sha256'],
-                    'source_ids': package['ids']}
-        prior = output.json_asset(prefix + '-receipt.json')
+        expected = output_identity(config, item, package)
+        prior = PublicSource(args.repo, tag, args.out / 'metadata').json_asset(prefix + '-receipt.json')
         if prior is not None:
             receipt_ok(output, prior, expected)
             for k in total: total[k] += prior[k]
             continue
-        source = sweep.Store(args.repo, package['tag'])
+        source = PublicSource(args.repo, package['tag'], args.out / 'metadata')
         path = download(source, package, args.out / 'input')
         ids = args.out / 'ids.json'; sweep.save(ids, package['ids'])
         destination = args.out / prefix
@@ -281,7 +429,8 @@ def work(args):
                 report['accepted'] + report['quarantined'] + report['failed'] != report['records']):
             raise ValueError('Toolbox did not account for assigned records')
         saved_parts = []
-        for index, file in enumerate(report['files']):
+        transport = carriers(destination, report['files']) if args.phase == 'full' else report['files']
+        for index, file in enumerate(transport):
             if Path(file['name']).name != file['name']:
                 raise ValueError('Unsafe toolbox output name')
             raw = destination / file['name']
@@ -293,7 +442,8 @@ def work(args):
         receipt = {**expected, 'outputs': saved_parts,
                    **{k: report[k] for k in ('records', 'accepted', 'quarantined', 'failed')},
                    'rows': report['positions'], 'entries': report['candidates'],
-                   'seconds': report['seconds'], 'cpus': report['cpus']}
+                   'seconds': report['seconds'], 'cpus': report['cpus'],
+                   **({'transport': 'box-carrier-1'} if args.phase == 'full' else {})}
         sweep.save(args.out / (prefix + '-receipt.json'), receipt)
         output.upload(args.out / (prefix + '-receipt.json'))
         path.unlink()
@@ -308,23 +458,29 @@ def summary(args):
     control, config = queue_config(args)
     item = config[args.phase]
     root = sweep.Store(args.repo, item['output_tag'])
-    tasks = root.json_asset('tasks.json')
+    tasks = PublicSource(args.repo, item['output_tag'], args.out / 'metadata').json_asset('tasks.json')
     if tasks['bundle'] != config['bundle'] or tasks['plan_sha256'] != item['plan_sha256']:
         raise ValueError('Summary task identity differs')
-    stores, missing, receipts, ids = {}, [], [], []
+    stores, source_stores, missing, receipts, ids = {}, {}, [], [], []
     counts = {k: 0 for k in ('records', 'accepted', 'quarantined', 'failed', 'rows', 'entries')}
     for task in tasks['tasks']:
         tag = f"{item['output_tag']}-w{task['shard'] // 16:02d}"
         if tag not in stores: stores[tag] = sweep.Store(args.repo, tag)
         store = stores[tag]
-        for package in task['packages']:
+        packages = task.get('packages')
+        if packages is None:
+            source_tag = task['source_tag']
+            if source_tag not in source_stores:
+                source_stores[source_tag] = PublicSource(args.repo, source_tag, args.out / 'metadata')
+            packages = chunk_packages(source_stores[source_tag], task, item['plan_sha256'])
+        if packages is None:
+            missing.append(f"chunk-{task['shard']:03d}-source"); continue
+        for package in packages:
             name = package['name'][:-4] + '-receipt.json'
-            report = store.json_asset(name)
+            report = PublicSource(args.repo, tag, args.out / 'metadata').json_asset(name)
             if report is None:
                 missing.append(name); continue
-            expected = {'schema': 'box-output-1', 'bundle_sha256': config['bundle']['sha256'],
-                        'source_sha256': package['sha256'], 'plan_sha256': item['plan_sha256'],
-                        'source_ids': package['ids']}
+            expected = output_identity(config, item, package)
             # Preserve failures in the aggregate; no successful-ready claim.
             receipt_ok(store, {**report, 'failed': 0}, expected)
             if report['records'] != len(package['ids']):
@@ -343,7 +499,10 @@ def summary(args):
     path = args.out / ('summary.json' if complete else 'incomplete-' + sweep.run_id() + '.json')
     sweep.save(path, result); root.upload(path)
     print(json.dumps({k: v for k, v in result.items() if k not in ('receipts', 'missing')}))
-    if not complete: raise RuntimeError('Offline output coverage is incomplete')
+    if not complete:
+        source_complete = PublicSource(args.repo, item['source_tag'], args.out / 'metadata').json_asset('summary.json')
+        if counts['failed'] or args.phase == 'pilot' or (source_complete and source_complete.get('complete')):
+            raise RuntimeError('Offline output coverage is incomplete')
 
 
 def main():
