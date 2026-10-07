@@ -559,7 +559,8 @@ def fetch(args, plan):
             records.append(record)
             pending_bytes += size
         except (ValueError, RuntimeError, OSError) as error:
-            failure = {'id': item['id'], 'type': type(error).__name__, 'failed_utc': now()}
+            failure = {'id': item['id'], 'type': type(error).__name__,
+                       'reason': str(error)[:240], 'failed_utc': now()}
             failures.append(failure)
             print(json.dumps({'failed_record': failure}), flush=True)
         if len(records) >= plan['checkpoint_records']:

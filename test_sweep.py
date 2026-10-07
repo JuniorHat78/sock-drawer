@@ -296,6 +296,7 @@ class Tests(unittest.TestCase):
                 sweep.fetch(args, data)
         self.assertEqual(saved[0]['collected_ids'], [])
         self.assertEqual(saved[0]['failures'][0]['id'], 1)
+        self.assertEqual(saved[0]['failures'][0]['reason'], 'Expected binary content')
 
     def test_completed_aggregate_rerun_reuses_immutable_inventory(self):
         data = plan()
