@@ -1,5 +1,6 @@
 """Run a bounded list of checked sealed steps, one at a time."""
 import argparse
+import datetime as dt
 import hashlib
 import json
 from pathlib import Path
@@ -15,8 +16,26 @@ def next_step(steps, receipts, active):
         report = receipts.get(step['tag'])
         if report is None: return 'dispatch', index
         if report.get('bundle_sha256') != step['sha256']: return 'identity_needs_attention', index
-        if report.get('success') is not True: return 'step_needs_attention', index
+        if report.get('success') is not True:
+            if step.get('optional') is True: continue
+            if (report.get('failure_type') == 'timeout' and report.get('resume_available') is True
+                    and index + 1 < len(steps) and steps[index + 1].get('resume_of') == step['tag']):
+                continue
+            return 'step_needs_attention', index
     return 'complete', None
+
+
+def retry_dispatch(state, index, step, runs, now):
+    """Retry only an intent that provably created no matching workflow run."""
+    saved = state.get('requests', {}).get(str(index))
+    if not saved or saved['attempts'] >= 3: return False
+    requested = dt.datetime.fromisoformat(saved['requested_utc'])
+    if (now - requested).total_seconds() < 120: return False
+    for run in runs:
+        if run['display_title'] == 'Probe ' + step['tag'] and run['head_branch'] == 'main':
+            created = dt.datetime.fromisoformat(run['created_at'].replace('Z', '+00:00'))
+            if created >= requested - dt.timedelta(seconds=5): return False
+    return True
 
 
 def run(args):
@@ -33,6 +52,8 @@ def run(args):
         sweep.identity(args.repo, step['tag'])
         if len(step['sha256']) != 64 or set(step['sha256']) - set('0123456789abcdef'):
             raise ValueError('Invalid step identity')
+        if 'optional' in step and type(step['optional']) is not bool: raise ValueError('Invalid optional step')
+        if step.get('resume_of') not in (None, *[s['tag'] for s in steps]): raise ValueError('Unknown resume source')
     identity = hashlib.sha256(json.dumps(config, sort_keys=True).encode()).hexdigest()
     state = source.json_asset('line-state.json') or {'schema': 'box-line-state-1', 'identity': identity, 'dispatched': []}
     if state['identity'] != identity: raise ValueError('Line configuration changed')
@@ -47,16 +68,33 @@ def run(args):
         if not control or control['bundle']['sha256'] != step['sha256']:
             raise ValueError('Step has no matching frozen program')
         report = reader.json_asset('probe-receipt.json')
+        latest_run = next((r for r in runs if r['display_title'] == 'Probe ' + step['tag'] and r['head_branch'] == 'main'), None)
+        if (report and report.get('failure_type') == 'timeout') or (report is None and latest_run and latest_run['conclusion'] == 'timed_out'):
+            inventory = sweep.Store(args.repo, step['tag'])
+            snapshots = sorted((a for a in inventory.assets.values() if a['name'].startswith('snapshot-') and a['name'].endswith('.json')),
+                               key=lambda a: a['created_at'])
+            saved = reader.json_asset(snapshots[-1]['name']) if snapshots else None
+            if saved and saved['bundle_sha256'] == step['sha256']:
+                verified = all(inventory.assets.get(o['name'], {}).get('digest') == 'sha256:' + o['sha256']
+                               and inventory.assets[o['name']]['size'] == o['bytes'] for o in saved['outputs'])
+                if verified:
+                    report = report or {'bundle_sha256': step['sha256'], 'success': False, 'failure_type': 'timeout'}
+                    report['resume_available'] = True
         if report: receipts[step['tag']] = report
     action, index = next_step(steps, receipts, active)
     if action == 'dispatch' and index in state['dispatched']:
-        # Preserve unfinished snapshots; do not repeat a failed private program.
-        action = 'step_needs_attention'
+        if not retry_dispatch(state, index, steps[index], runs, dt.datetime.now(dt.timezone.utc)):
+            # Preserve unfinished snapshots; do not repeat a failed private program.
+            action = 'step_needs_attention'
     state.update(action=action, index=index, active=active, checked_utc=sweep.now())
     inputs = None
     if action == 'dispatch':
-        state['dispatched'].append(index)
+        if index not in state['dispatched']: state['dispatched'].append(index)
+        requests = state.setdefault('requests', {})
+        attempts = requests.get(str(index), {}).get('attempts', 0)
+        requests[str(index)] = {'requested_utc': sweep.now(), 'attempts': attempts + 1}
         inputs = {'ref': 'main', 'inputs': {'tag': steps[index]['tag']}}
+    state['failed_optional'] = [s['tag'] for s in steps if s.get('optional') and receipts.get(s['tag'], {}).get('success') is False]
     if action in ('complete', 'identity_needs_attention', 'step_needs_attention'):
         state['finished'] = True
     path = args.out / 'line-state.json'; sweep.save(path, state)

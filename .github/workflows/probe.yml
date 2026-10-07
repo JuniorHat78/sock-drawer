@@ -1,4 +1,5 @@
 name: Probe
+run-name: Probe ${{ inputs.tag }}
 on:
   workflow_dispatch:
     inputs:

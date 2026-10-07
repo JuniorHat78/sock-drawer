@@ -617,7 +617,7 @@ def probe(args):
     plain = args.out / 'toolbox.tar.gz'; unseal(parcel, plain, key)
     runtime = args.out / 'toolbox'; bundle = safe_extract(plain, runtime); plain.unlink()
     result_dir = args.out / 'private'; result_dir.mkdir()
-    success = False
+    success = False; failure_type = 'execution'
     try:
         input_dir = probe_inputs(bundle, args, key)
         resume = probe_resume(bundle, args, key)
@@ -635,7 +635,9 @@ def probe(args):
             if resume is not None:
                 command.extend(['--resume', str(resume.resolve())])
             success = probe_process(command, runtime, result_dir, store, key, limit, config['bundle']['sha256'])
+        else: failure_type = 'setup'
     except (subprocess.TimeoutExpired, OSError, ValueError, RuntimeError) as error:
+        failure_type = 'timeout' if isinstance(error, subprocess.TimeoutExpired) else 'validation' if isinstance(error, ValueError) else 'io'
         (result_dir / 'failure.log').write_text(type(error).__name__ + ': ' + str(error), encoding='utf-8')
     archive_path = args.out / 'probe-result.tar.gz'
     probe_archive(result_dir, archive_path)
@@ -644,6 +646,7 @@ def probe(args):
     saved.update(plain_sha256=sweep.sha(archive_path), tag=args.tag)
     receipt = {'schema': 'box-probe-output-1', 'bundle_sha256': config['bundle']['sha256'],
                'success': success, 'outputs': [saved], 'cpus': min(4, os.cpu_count() or 1),
+               'failure_type': None if success else failure_type,
                'seconds': time.perf_counter() - started}
     sweep.save(args.out / 'probe-receipt.json', receipt); store.upload(args.out / 'probe-receipt.json')
     print(json.dumps({'probe_complete': success, 'seconds': receipt['seconds']}), flush=True)
