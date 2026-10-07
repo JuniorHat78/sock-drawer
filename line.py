@@ -75,7 +75,7 @@ def run(args):
                                key=lambda a: a['created_at'])
             saved = reader.json_asset(snapshots[-1]['name']) if snapshots else None
             if saved and saved['bundle_sha256'] == step['sha256']:
-                verified = all(inventory.assets.get(o['name'], {}).get('digest') == 'sha256:' + o['sha256']
+                verified = len(saved['outputs']) == 1 and all(inventory.assets.get(o['name'], {}).get('digest') == 'sha256:' + o['sha256']
                                and inventory.assets[o['name']]['size'] == o['bytes'] for o in saved['outputs'])
                 if verified:
                     report = report or {'bundle_sha256': step['sha256'], 'success': False, 'failure_type': 'timeout'}
