@@ -1,0 +1,25 @@
+name: Press
+on:
+  workflow_dispatch:
+permissions:
+  contents: write
+concurrency:
+  group: press
+  cancel-in-progress: false
+defaults:
+  run:
+    shell: bash
+jobs:
+  compare:
+    if: ${{ github.ref == 'refs/heads/main' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - name: Compare storage
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: python -B press.py --repo "$REPO" --source-tag b20261007-w00 --asset chunk-000-part-000.tar --output-tag p20261007 --limit 32 --out out
