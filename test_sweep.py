@@ -6,6 +6,8 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import threading
+import time
 import tarfile
 import shutil
 from types import SimpleNamespace
@@ -115,12 +117,51 @@ class Tests(unittest.TestCase):
             return Response()
         client = sweep.Client('https://source.example', 3)
         client.opener = SimpleNamespace(open=opened)
-        with patch.object(sweep.time, 'monotonic', return_value=100), patch.object(sweep.time, 'sleep') as sleep:
+        clock = [100.0]
+        waits = []
+        def sleep(seconds):
+            waits.append(seconds)
+            clock[0] += seconds
+        with patch.object(sweep.time, 'monotonic', side_effect=lambda: clock[0]), patch.object(sweep.time, 'sleep', side_effect=sleep):
             client.get('https://source.example/file')
         self.assertEqual(client.slowdown, 2)
-        self.assertIn(unittest.mock.call(120), sleep.call_args_list)
-        self.assertIn(unittest.mock.call(6), sleep.call_args_list)
+        self.assertIn(120, waits)
+        self.assertGreaterEqual(clock[0], 220)
         self.assertEqual(client.requests['retry_429'], 1)
+
+    def test_concurrent_source_requests_share_one_gate(self):
+        gate = sweep.Gate(.01)
+        times = []
+        lock = threading.Lock()
+        def acquire(i):
+            gate.acquire()
+            with lock:
+                times.append(time.monotonic())
+            return i
+        self.assertEqual(list(sweep.ordered_results(acquire, range(12), 4)), list(range(12)))
+        times.sort()
+        self.assertGreaterEqual(times[-1] - times[0], .105)
+
+    def test_retry_after_blocks_every_lane_sharing_a_gate(self):
+        gate = sweep.Gate(1)
+        clock = [100.0]
+        def sleep(seconds): clock[0] += seconds
+        with patch.object(sweep.time, 'monotonic', side_effect=lambda: clock[0]), patch.object(sweep.time, 'sleep', side_effect=sleep):
+            gate.acquire()
+            gate.backoff(120)
+            self.assertEqual(gate.acquire(), 120)
+            self.assertEqual(clock[0], 220)
+            self.assertEqual(gate.slowdown, 2)
+
+    def test_more_lanes_do_not_multiply_the_origin_budget(self):
+        data = plan()
+        args = SimpleNamespace(parallel=40, rpm=1200, lanes=4)
+        policy = sweep.execution(args, data)
+        self.assertEqual(60 * policy['parallel'] / policy['rpm'], 2)
+        args.lanes = 1
+        self.assertEqual(sweep.execution(args, data)['rpm'], 1200)
+        args.rpm = 1201
+        with self.assertRaises(ValueError): sweep.execution(args, data)
 
     def test_wire_gzip_is_decoded_but_source_gzip_bytes_are_preserved(self):
         raw = gzip.compress(b'original source file', mtime=0)

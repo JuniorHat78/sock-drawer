@@ -17,6 +17,18 @@ on:
         required: true
         default: false
         type: boolean
+      parallel:
+        description: Maximum active jobs
+        default: 20
+        type: number
+      rpm:
+        description: Combined origin request ceiling
+        default: 360
+        type: number
+      lanes:
+        description: Transfers per job
+        default: 1
+        type: number
 
 permissions:
   contents: write
@@ -34,6 +46,9 @@ env:
   REPO: ${{ github.repository }}
   TAG: ${{ inputs.tag }}
   PLAN_SHA: ${{ inputs.sha256 }}
+  PARALLEL: ${{ inputs.parallel }}
+  RPM: ${{ inputs.rpm }}
+  LANES: ${{ inputs.lanes }}
 
 jobs:
   prepare:
@@ -54,7 +69,7 @@ jobs:
           gh release download "$TAG" --repo "$REPO" --pattern manifest.json --dir input
       - name: Queue
         id: queue
-        run: python -B sweep.py prepare --manifest input/manifest.json --sha256 "$PLAN_SHA" --repo "$REPO" --tag "$TAG" --out out
+        run: python -B sweep.py prepare --manifest input/manifest.json --sha256 "$PLAN_SHA" --repo "$REPO" --tag "$TAG" --out out --parallel "$PARALLEL" --rpm "$RPM" --lanes "$LANES"
 
   collect:
     needs: prepare
@@ -76,7 +91,7 @@ jobs:
       - name: Fill boxes
         env:
           CHUNK: ${{ matrix.shard }}
-        run: python -B sweep.py fetch --manifest input/manifest.json --sha256 "$PLAN_SHA" --repo "$REPO" --tag "$TAG" --shard "$CHUNK" --out out
+        run: python -B sweep.py fetch --manifest input/manifest.json --sha256 "$PLAN_SHA" --repo "$REPO" --tag "$TAG" --shard "$CHUNK" --out out --parallel "$PARALLEL" --rpm "$RPM" --lanes "$LANES"
 
   summary:
     needs: [prepare, collect]

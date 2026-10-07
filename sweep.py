@@ -2,7 +2,8 @@
 from __future__ import annotations
 
 import argparse
-from collections import Counter
+from collections import Counter, deque
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 import gzip
@@ -16,6 +17,7 @@ from pathlib import Path
 import re
 import subprocess
 import tarfile
+import threading
 import time
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode, urljoin, urlsplit
@@ -76,14 +78,42 @@ class NoRedirect(HTTPRedirectHandler):
         return None
 
 
+class Gate:
+    def __init__(self, interval):
+        self.interval, self.last = interval, 0.0
+        self.slowdown, self.blocked_until = 1.0, 0.0
+        self.lock = threading.Lock()
+
+    def acquire(self):
+        waited = 0.0
+        while True:
+            with self.lock:
+                current = time.monotonic()
+                delay = max(0, self.last + self.interval * self.slowdown - current,
+                            self.blocked_until - current)
+                if delay <= 0:
+                    self.last = current
+                    return waited
+            time.sleep(delay)
+            waited += delay
+
+    def backoff(self, seconds):
+        with self.lock:
+            self.slowdown = min(8, self.slowdown * 2)
+            self.blocked_until = max(self.blocked_until, time.monotonic() + seconds)
+
+
 class Client:
-    def __init__(self, origin, interval):
+    def __init__(self, origin, interval, gate=None):
         self.origin = https_url(origin).netloc
         self.interval, self.last = interval, 0.0
+        self.gate = gate or Gate(interval)
         self.opener = build_opener(NoRedirect())
         self.requests = Counter()
         self.wait_seconds = 0.0
         self.slowdown = 1.0
+        self.transfer_seconds = Counter()
+        self.received_bytes = Counter()
 
     def get(self, url):
         requested = url
@@ -92,12 +122,11 @@ class Client:
             parsed = https_url(url)
             origin = parsed.netloc == self.origin
             if origin:
-                delay = max(0, self.last + self.interval * self.slowdown - time.monotonic())
-                time.sleep(delay)
-                self.wait_seconds += delay
-                self.last = time.monotonic()
+                self.wait_seconds += self.gate.acquire()
+                self.slowdown = self.gate.slowdown
             kind = 'origin' if origin else 'download'
             self.requests[kind] += 1
+            began = time.monotonic()
             try:
                 request = Request(url, headers={'User-Agent': 'url-bundler/1', 'Accept-Encoding': 'gzip'})
                 with self.opener.open(request, timeout=90) as response:
@@ -108,6 +137,7 @@ class Client:
                 if len(raw) > MAX_BYTES:
                     raise ValueError('Response exceeds the size bound')
                 wire_bytes = len(raw)
+                self.received_bytes[kind] += wire_bytes
                 if encoding == 'gzip':
                     with gzip.GzipFile(fileobj=io.BytesIO(raw)) as stream:
                         raw = stream.read(MAX_BYTES + 1)
@@ -128,24 +158,55 @@ class Client:
                     continue
                 if status not in (429, 500, 502, 503, 504) or attempts >= 5:
                     raise RuntimeError(f'HTTP {status} from {kind}') from None
-                if status == 429:
-                    self.slowdown = min(8, self.slowdown * 2)
                 delay = retry_seconds(retry, attempts)
                 if delay > 600:
                     raise RuntimeError(f'HTTP {status}: requested wait exceeds this attempt') from None
                 self.requests[f'retry_{status}'] += 1
+                if status == 429:
+                    self.gate.backoff(delay)
+                    self.slowdown = self.gate.slowdown
             except (URLError, TimeoutError, OSError):
                 if attempts >= 5:
                     raise RuntimeError(f'Transfer failed from {kind}') from None
                 delay = retry_seconds(None, attempts)
                 self.requests['retry_network'] += 1
+            finally:
+                self.transfer_seconds[kind] += time.monotonic() - began
             time.sleep(delay)
             self.wait_seconds += delay
             attempts += 1
 
     def stats(self):
         return {'requests': dict(self.requests), 'wait_seconds': self.wait_seconds,
-                'interval_seconds': self.interval, 'slowdown': self.slowdown}
+                'interval_seconds': self.interval, 'slowdown': self.gate.slowdown,
+                'transfer_seconds': dict(self.transfer_seconds), 'received_bytes': dict(self.received_bytes)}
+
+
+def execution(args, plan):
+    policy = {'parallel': getattr(args, 'parallel', 0) or plan['parallel'],
+              'rpm': getattr(args, 'rpm', 0) or plan['origin_rpm'],
+              'lanes': getattr(args, 'lanes', 1)}
+    if (any(type(v) is not int for v in policy.values()) or not 1 <= policy['parallel'] <= 40
+            or not 60 <= policy['rpm'] <= 1200 or not 1 <= policy['lanes'] <= 4):
+        raise ValueError('Execution policy outside declared bounds')
+    return policy
+
+
+def ordered_results(function, items, lanes):
+    """Bound queued work and preserve input order while transfers overlap."""
+    source = iter(items)
+    with ThreadPoolExecutor(max_workers=lanes) as pool:
+        pending = deque()
+        for _ in range(lanes * 2):
+            item = next(source, None)
+            if item is None:
+                break
+            pending.append(pool.submit(function, item))
+        while pending:
+            yield pending.popleft().result()
+            item = next(source, None)
+            if item is not None:
+                pending.append(pool.submit(function, item))
 
 
 def github_pause(stderr, attempt):
@@ -468,6 +529,7 @@ def discard(out, path, records):
 
 
 def prepare(args, plan):
+    policy = execution(args, plan)
     stores, missing = {}, []
     for shard in range(math.ceil(len(plan['records']) / 512)):
         tag = wave(args.tag, shard)
@@ -483,13 +545,46 @@ def prepare(args, plan):
         if read_summary(stores[tag], shard, plan, args.sha256) is None:
             missing.append(shard)
     output = {'matrix': json.dumps({'shard': missing}, separators=(',', ':')),
-              'parallel': str(plan['parallel']), 'count': str(len(missing))}
+              'parallel': str(policy['parallel']), 'count': str(len(missing))}
     if os.environ.get('GITHUB_OUTPUT'):
         with open(os.environ['GITHUB_OUTPUT'], 'a', encoding='utf-8') as stream:
             for key, value in output.items():
                 stream.write(f'{key}={value}\n')
     print(json.dumps({'queued_chunks': len(missing), 'records': len(plan['records']),
-                      'retained_elsewhere': len(plan['retained_ids'])}), flush=True)
+                      'retained_elsewhere': len(plan['retained_ids']), 'execution_policy': policy}), flush=True)
+
+
+def fetch_record(item, plan, out, gate):
+    client = Client(plan['origin'], gate.interval, gate=gate)
+    try:
+        files, contents = [], []
+        for source in item['files']:
+            raw, receipt = client.get(plan['origin'].rstrip('/') + source['path'])
+            mime = receipt['content_type'].split(';', 1)[0].lower()
+            if not raw:
+                raise ValueError('Empty source file')
+            if source['kind'] == 'binary' and (mime.startswith('text/') or mime.endswith('json')
+                    or raw.lstrip()[:30].lower().startswith((b'<!doctype', b'<html', b'{"error"'))):
+                raise ValueError('Expected binary content')
+            if source['kind'] == 'text':
+                raw.decode('utf-8')
+            compressed = gzip.compress(raw, compresslevel=6, mtime=0)
+            if digest(gzip.decompress(compressed)) != receipt['sha256']:
+                raise ValueError('Compression round-trip differs')
+            files.append({'name': source['name'], **receipt, 'gzip_bytes': len(compressed),
+                          'gzip_sha256': digest(compressed)})
+            contents.append(compressed)
+        record = {'id': item['id'], 'attributes': item['attributes'], 'source_files': item['files'], 'files': files}
+        size = sum(map(len, contents)) + len(json.dumps(record)) + 8192
+        folder = out / f'record-{item["id"]}'
+        folder.mkdir(exist_ok=True)
+        for file, content in zip(files, contents):
+            (folder / file['name']).write_bytes(content)
+        save(folder / 'meta.json', record)
+        return {'record': record, 'bytes': size, 'network': client.stats()}
+    except (ValueError, RuntimeError, OSError) as error:
+        return {'failure': {'id': item['id'], 'type': type(error).__name__,
+                           'reason': str(error)[:240], 'failed_utc': now()}, 'network': client.stats()}
 
 
 def fetch(args, plan):
@@ -500,8 +595,15 @@ def fetch(args, plan):
     if read_summary(store, args.shard, plan, args.sha256) is not None:
         print(json.dumps({'reused_chunk': args.shard, 'records': len(rows)}), flush=True)
         return
-    time.sleep((args.shard % plan['parallel']) * 60 / plan['origin_rpm'])
-    client = Client(plan['origin'], 60 * plan['parallel'] / plan['origin_rpm'])
+    policy = execution(args, plan)
+    time.sleep((args.shard % policy['parallel']) * 60 / policy['rpm'])
+    gate = Gate(60 * policy['parallel'] / policy['rpm'])
+    counters = {'requests': Counter(), 'transfer_seconds': Counter(), 'received_bytes': Counter()}
+    total_wait = 0.0
+
+    def stats():
+        return {**{k: dict(v) for k,v in counters.items()}, 'wait_seconds': total_wait,
+                'interval_seconds': gate.interval, 'slowdown': gate.slowdown}
     recovered = store.recover(prefix, args.out, args.sha256)
     all_records = [r for c in recovered for r in c['records']]
     verify_rows(all_records, rows)
@@ -526,53 +628,34 @@ def fetch(args, plan):
         print(json.dumps({'checkpoint': receipt['name'], 'records': len(records), 'bytes': receipt['bytes']}), flush=True)
         records, pending_bytes, part = [], 0, part + 1
 
-    for index, item in enumerate(rows):
-        if item['id'] in done:
-            continue
-        try:
-            files, contents = [], []
-            for source in item['files']:
-                raw, receipt = client.get(plan['origin'].rstrip('/') + source['path'])
-                mime = receipt['content_type'].split(';', 1)[0].lower()
-                if not raw:
-                    raise ValueError('Empty source file')
-                if source['kind'] == 'binary' and (mime.startswith('text/') or mime.endswith('json')
-                        or raw.lstrip()[:30].lower().startswith((b'<!doctype', b'<html', b'{"error"'))):
-                    raise ValueError('Expected binary content')
-                if source['kind'] == 'text':
-                    raw.decode('utf-8')
-                compressed = gzip.compress(raw, compresslevel=6, mtime=0)
-                if digest(gzip.decompress(compressed)) != receipt['sha256']:
-                    raise ValueError('Compression round-trip differs')
-                files.append({'name': source['name'], **receipt, 'gzip_bytes': len(compressed),
-                              'gzip_sha256': digest(compressed)})
-                contents.append(compressed)
-            record = {'id': item['id'], 'attributes': item['attributes'], 'source_files': item['files'], 'files': files}
-            size = sum(map(len, contents)) + len(json.dumps(record)) + 8192
-            if records and pending_bytes + size > PACKAGE_BYTES:
+    todo = [r for r in rows if r['id'] not in done]
+    def work(item):
+        return fetch_record(item, plan, args.out, gate)
+    for index, result in enumerate(ordered_results(work, todo, policy['lanes'])):
+        network = result['network']
+        total_wait += network.get('wait_seconds', 0)
+        for key in counters:
+            counters[key].update(network.get(key, {}))
+        if 'failure' in result:
+            failures.append(result['failure'])
+            print(json.dumps({'failed_record': result['failure']}), flush=True)
+        else:
+            if records and pending_bytes + result['bytes'] > PACKAGE_BYTES:
                 checkpoint()
-            folder = args.out / f'record-{item["id"]}'
-            folder.mkdir(exist_ok=True)
-            for file, content in zip(files, contents):
-                (folder / file['name']).write_bytes(content)
-            save(folder / 'meta.json', record)
-            records.append(record)
-            pending_bytes += size
-        except (ValueError, RuntimeError, OSError) as error:
-            failure = {'id': item['id'], 'type': type(error).__name__,
-                       'reason': str(error)[:240], 'failed_utc': now()}
-            failures.append(failure)
-            print(json.dumps({'failed_record': failure}), flush=True)
+            records.append(result['record'])
+            pending_bytes += result['bytes']
         if len(records) >= plan['checkpoint_records']:
             checkpoint()
         if (index + 1) % 25 == 0:
             print(json.dumps({'chunk': args.shard, 'attempted': index + 1,
-                'collected': len(all_records) + len(records), 'failed': len(failures), 'network': client.stats()}), flush=True)
+                'collected': len(all_records) + len(records), 'failed': len(failures),
+                'seconds': time.monotonic() - started, 'execution_policy': policy, 'network': stats()}), flush=True)
     checkpoint()
     summary = {'schema': SCHEMA, 'plan_sha256': args.sha256, 'shard': args.shard,
                'assigned_ids': [r['id'] for r in rows], 'collected_ids': [r['id'] for r in all_records],
                'records': all_records, 'packages': packages, 'failures': failures,
-               'completed_utc': now(), 'seconds': time.monotonic() - started, 'network': client.stats()}
+               'completed_utc': now(), 'seconds': time.monotonic() - started,
+               'execution_policy': policy, 'network': stats()}
     name = prefix + '-summary.json' if not failures else prefix + '-attempt-' + run_id() + '.json'
     path = args.out / name
     save(path, summary)
@@ -638,6 +721,9 @@ def main():
     parser.add_argument('--tag', required=True)
     parser.add_argument('--shard', type=int, default=0)
     parser.add_argument('--out', type=Path, required=True)
+    parser.add_argument('--parallel', type=int, default=0)
+    parser.add_argument('--rpm', type=int, default=0)
+    parser.add_argument('--lanes', type=int, default=1)
     args = parser.parse_args()
     identity(args.repo, args.tag)
     plan = read_plan(args.manifest, args.sha256)
