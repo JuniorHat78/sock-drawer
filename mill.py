@@ -508,7 +508,7 @@ def summary(args):
 
 def probe_inputs(bundle, args, key):
     attachments = bundle.get('inputs', [])
-    if not isinstance(attachments, list) or len(attachments) > 64:
+    if not isinstance(attachments, list) or len(attachments) > 512:
         raise ValueError('Unsupported input count')
     if sum(item['bytes'] for item in attachments) > 16 * 1024**3:
         raise ValueError('Inputs exceed the total size budget')
@@ -537,8 +537,9 @@ def probe_resume(bundle, args, key):
     report = source.json_asset('probe-receipt.json')
     if report is None:
         inventory = sweep.Store(args.repo, item['tag'])
-        names = sorted(a['name'] for a in inventory.assets.values() if re.fullmatch(r'snapshot-[0-9-]+\.json', a['name']))
-        report = source.json_asset(names[-1]) if names else None
+        candidates = sorted((a for a in inventory.assets.values() if re.fullmatch(r'snapshot-[0-9-]+\.json', a['name'])),
+                            key=lambda a: a['created_at'])
+        report = source.json_asset(candidates[-1]['name']) if candidates else None
     if not report or report.get('bundle_sha256') != item['bundle_sha256'] or len(report['outputs']) != 1:
         raise ValueError('Resume has no matching checked checkpoint')
     saved = report['outputs'][0]

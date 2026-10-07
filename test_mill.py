@@ -74,7 +74,7 @@ class Boxes(unittest.TestCase):
 
     def test_probe_inputs_have_bounded_disk_and_package_counts(self):
         args = SimpleNamespace(repo='owner/repo', out=self.root)
-        with self.assertRaises(ValueError): mill.probe_inputs({'inputs': [{}] * 65}, args, self.key)
+        with self.assertRaises(ValueError): mill.probe_inputs({'inputs': [{}] * 513}, args, self.key)
         with self.assertRaises(ValueError): mill.probe_inputs({'inputs': [{'bytes': 17 * 1024**3}]}, args, self.key)
 
     def test_live_snapshot_excludes_incomplete_files_and_keeps_complete_checkpoint(self):

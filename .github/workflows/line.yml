@@ -1,0 +1,38 @@
+name: Line
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '7,22,37,52 * * * *'
+  workflow_run:
+    workflows: [Probe]
+    branches: [main]
+    types: [completed]
+permissions:
+  contents: write
+  actions: write
+concurrency:
+  group: line
+  cancel-in-progress: false
+defaults:
+  run:
+    shell: bash
+jobs:
+  check:
+    if: ${{ github.ref == 'refs/heads/main' && (github.event_name != 'workflow_run' || github.event.workflow_run.head_repository.full_name == github.repository) }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+          ref: main
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - run: python -m pip install --disable-pip-version-check cryptography==42.0.8
+      - run: python -B -m unittest -v test_line
+      - name: Check sealed line
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: python -B line.py --repo "$REPO" --tag l20261007 --out out
