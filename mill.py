@@ -634,6 +634,28 @@ def probe_process(command, runtime, result_dir, store, key, limit, bundle_sha):
             stop_probe(process)
 
 
+def probe_preflight(runtime, bundle, result_dir, store, bundle_sha):
+    """Run checked packaged tests before acquiring the larger input attachments."""
+    directories = sorted({Path(name).parent for name in bundle['files']
+                          if Path(name).name.startswith('test_') and Path(name).suffix == '.py'
+                          and 'tests' in Path(name).parts})
+    environment = child_environment()
+    python_paths = {str((runtime / name).parent.resolve()) for name in bundle['files'] if name.endswith('.py')}
+    environment['PYTHONPATH'] = os.pathsep.join(sorted(python_paths))
+    began = time.perf_counter(); passed = True
+    with (result_dir / 'preflight.log').open('wb') as log:
+        for directory in directories:
+            source = (runtime / directory).resolve()
+            if not source.is_relative_to(runtime.resolve()): raise ValueError('Unsafe test directory')
+            completed = subprocess.run([sys.executable, '-B', '-m', 'unittest', 'discover', '-v', '-s', str(source)],
+                                       cwd=runtime, env=environment, stdout=log, stderr=subprocess.STDOUT, timeout=180)
+            if completed.returncode: passed = False; break
+    report = {'schema': 'box-probe-preflight-1', 'bundle_sha256': bundle_sha,
+              'passed': passed, 'test_directories': len(directories), 'seconds': time.perf_counter() - began}
+    path = result_dir.parent / 'preflight.json'; sweep.save(path, report); store.upload(path)
+    return passed
+
+
 def probe(args):
     """One bounded CPU experiment; its program and diagnostics stay sealed."""
     control = PublicSource(args.repo, args.tag, args.out / 'metadata')
@@ -660,8 +682,6 @@ def probe(args):
     result_dir = args.out / 'private'; result_dir.mkdir()
     success = False; failure_type = 'execution'
     try:
-        input_dir = probe_inputs(bundle, args, key)
-        resume = probe_resume(bundle, args, key)
         limit = bundle.get('seconds', 1800)
         if type(limit) is not int or not 30 <= limit <= 19800:
             raise ValueError('Unsupported experiment time budget')
@@ -669,14 +689,16 @@ def probe(args):
             setup = subprocess.run([sys.executable, '-m', 'pip', 'install', '--disable-pip-version-check',
                 '-r', str(runtime / bundle['requirements'])], stdout=log, stderr=subprocess.STDOUT,
                 env=child_environment(), timeout=600)
-        if setup.returncode == 0:
+        if setup.returncode == 0 and probe_preflight(runtime, bundle, result_dir, store, config['bundle']['sha256']):
+            input_dir = probe_inputs(bundle, args, key)
+            resume = probe_resume(bundle, args, key)
             command = [sys.executable, str(runtime / bundle['entry']), '--output', str(result_dir.resolve())]
             if input_dir is not None:
                 command.extend(['--inputs', str(input_dir.resolve())])
             if resume is not None:
                 command.extend(['--resume', str(resume.resolve())])
             success = probe_process(command, runtime, result_dir, store, key, limit, config['bundle']['sha256'])
-        else: failure_type = 'setup'
+        else: failure_type = 'setup' if setup.returncode else 'preflight'
     except (subprocess.TimeoutExpired, OSError, ValueError, RuntimeError) as error:
         failure_type = 'timeout' if isinstance(error, subprocess.TimeoutExpired) else 'validation' if isinstance(error, ValueError) else 'io'
         (result_dir / 'failure.log').write_text(type(error).__name__ + ': ' + str(error), encoding='utf-8')

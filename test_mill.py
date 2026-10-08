@@ -94,6 +94,32 @@ class Boxes(unittest.TestCase):
         with self.assertRaises(ValueError): mill.probe_inputs({'inputs': [{}] * 513}, args, self.key)
         with self.assertRaises(ValueError): mill.probe_inputs({'inputs': [{'bytes': 17 * 1024**3}]}, args, self.key)
 
+    def test_packaged_preflight_can_import_checked_helpers_without_secret_environment(self):
+        runtime = self.root / 'runtime'; tests = runtime / 'lib/tests'; tests.mkdir(parents=True)
+        (runtime / 'lib/helper.py').write_text('value = 4\n')
+        (tests / 'test_one.py').write_text('import unittest, os, helper\nclass One(unittest.TestCase):\n'
+            ' def test_checked(self):\n  self.assertEqual(helper.value,4)\n'
+            '  self.assertNotIn("BOX_KEY",os.environ)\n  self.assertNotIn("GH_TOKEN",os.environ)\n')
+        result = self.root / 'private'; result.mkdir()
+        files = {'lib/helper.py': '', 'lib/tests/test_one.py': ''}
+        store = Mock()
+        with patch.dict(os.environ, {'BOX_KEY': 'test-only', 'GH_TOKEN': 'test-only'}):
+            self.assertTrue(mill.probe_preflight(runtime, {'files':files}, result, store, 'b' * 64))
+        report = json.loads((self.root / 'preflight.json').read_text())
+        self.assertTrue(report['passed']); self.assertEqual(report['test_directories'], 1)
+        self.assertNotIn('lib', json.dumps(report))
+
+    def test_failed_preflight_prevents_input_downloads_and_execution_and_preserves_receipt(self):
+        control = SimpleNamespace(json_asset=lambda name:{'schema':'box-probe-1','repo':'owner/repo','bundle':{'sha256':'b'*64}})
+        store = Mock(); store.json_asset.return_value = None
+        args = SimpleNamespace(repo='owner/repo', tag='revision', out=self.root)
+        bundle = {'seconds':60,'requirements':'requirements.txt','entry':'run.py','files':{}}
+        with patch.object(mill, 'PublicSource', return_value=control), patch.object(mill, 'store_at', return_value=store), patch.object(mill, 'key_bytes', return_value=self.key), patch.object(mill, 'download', return_value=self.root/'parcel.box'), patch.object(mill, 'unseal', side_effect=lambda source,destination,key:destination.write_bytes(b'plain')), patch.object(mill, 'safe_extract', return_value=bundle), patch.object(mill.subprocess, 'run', return_value=SimpleNamespace(returncode=0)), patch.object(mill, 'probe_preflight', return_value=False), patch.object(mill, 'probe_inputs') as acquire, patch.object(mill, 'probe_process') as execute, patch.object(mill, 'sealed_upload', return_value={'name':'probe-result.box'}):
+            with self.assertRaises(RuntimeError): mill.probe(args)
+        acquire.assert_not_called(); execute.assert_not_called()
+        receipt = json.loads((self.root/'probe-receipt.json').read_text())
+        self.assertFalse(receipt['success']); self.assertEqual(receipt['failure_type'],'preflight')
+
     def test_live_snapshot_excludes_incomplete_files_and_keeps_complete_checkpoint(self):
         folder = self.root / 'private'; folder.mkdir()
         (folder / 'latest.pt').write_bytes(b'complete model state')
