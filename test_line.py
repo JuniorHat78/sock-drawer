@@ -9,6 +9,53 @@ import line
 
 
 class LineTests(unittest.TestCase):
+    def parallel_fixture(self):
+        now = dt.datetime(2026, 10, 8, 3, tzinfo=dt.timezone.utc)
+        steps = [{'tag': 'a', 'sha256': 'x'}, {'tag': 'b', 'sha256': 'y', 'after': ['a']},
+                 {'tag': 'c', 'sha256': 'z'}, {'tag': 'd', 'sha256': 'w'}]
+        run = {'id': 10, 'display_title': 'Probe a', 'head_branch': 'main', 'status': 'in_progress',
+               'created_at': now.isoformat(), 'updated_at': now.isoformat()}
+        return now, steps, run
+
+    def test_parallel_independent_steps_fill_slots_while_dependent_step_waits(self):
+        now, steps, run = self.parallel_fixture()
+        action, ready, issues, reserved, states = line.parallel_steps(steps, {}, [run], {'dispatched': []}, 3, now)
+        self.assertEqual((action, ready, issues, reserved), ('dispatch', [2, 3], [], 0))
+        self.assertEqual(states['b'], 'dependency_wait')
+
+    def test_parallel_unconfirmed_intents_reserve_capacity_and_are_not_repeated(self):
+        now, steps, run = self.parallel_fixture()
+        state = {'dispatched': [2], 'requests': {'2': {'attempts': 1, 'requested_utc': now.isoformat()}}}
+        action, ready, _, reserved, _ = line.parallel_steps(steps, {}, [run], state, 2, now)
+        self.assertEqual((action, ready, reserved), ('wait', [], 1))
+
+    def test_parallel_failure_blocks_its_dependency_but_runs_independent_work(self):
+        now, steps, _ = self.parallel_fixture()
+        receipt = {'a': {'bundle_sha256': 'x', 'success': False}}
+        action, ready, issues, _, states = line.parallel_steps(steps, receipt, [], {'dispatched': []}, 8, now)
+        self.assertEqual((action, ready, issues), ('dispatch', [2, 3], [0]))
+        self.assertEqual(states['b'], 'dependency_wait')
+
+    def test_parallel_completed_job_waits_for_visibility_without_redispatch(self):
+        now, steps, run = self.parallel_fixture()
+        run['status'] = 'completed'
+        action, ready, _, _, states = line.parallel_steps(steps, {}, [run], {'dispatched': []}, 3, now)
+        self.assertEqual(ready, [2, 3]); self.assertEqual(states['a'], 'receipt_visibility')
+
+    def test_parallel_resume_requires_checked_timeout_and_explicit_dependency(self):
+        now, steps, _ = self.parallel_fixture()
+        steps[1]['resume_of'] = 'a'
+        receipt = {'a': {'bundle_sha256': 'x', 'success': False, 'failure_type': 'timeout', 'resume_available': True}}
+        self.assertEqual(line.parallel_steps(steps, receipt, [], {'dispatched': []}, 3, now)[1], [1, 2, 3])
+        receipt['a']['resume_available'] = False
+        self.assertEqual(line.parallel_steps(steps, receipt, [], {'dispatched': []}, 3, now)[1], [2, 3])
+
+    def test_parallel_optional_failure_cannot_silently_complete_a_blocked_dependent(self):
+        now, steps, _ = self.parallel_fixture()
+        steps = steps[:2]; steps[0]['optional'] = True
+        receipt = {'a': {'bundle_sha256': 'x', 'success': False}}
+        self.assertEqual(line.parallel_steps(steps, receipt, [], {'dispatched': []}, 3, now)[0], 'step_needs_attention')
+
     def test_watch_rolls_over_before_runner_deadline(self):
         args = SimpleNamespace(watch_seconds=180)
         with patch.object(line, 'run', return_value={'finished': False}), patch.object(line, 'wake') as wake:

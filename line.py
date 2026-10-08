@@ -1,4 +1,4 @@
-"""Run a bounded list of checked sealed steps, one at a time."""
+"""Run bounded checked sealed steps with explicit dependencies."""
 import argparse
 import datetime as dt
 import hashlib
@@ -64,28 +64,82 @@ def read_receipt(repo, tag, reader, latest_run):
     return report
 
 
+def parallel_steps(steps, receipts, runs, state, parallel, now):
+    active = [r for r in runs if r['head_branch'] == 'main' and r['status'] != 'completed']
+    latest = {s['tag']: next((r for r in runs if r['display_title'] == 'Probe ' + s['tag']
+              and r['head_branch'] == 'main'), None) for s in steps}
+    statuses = {}; issues = []; reserved = 0
+    for index, step in enumerate(steps):
+        saved = receipts.get(step['tag']); run = latest[step['tag']]
+        if saved and saved.get('bundle_sha256') != step['sha256']:
+            return 'identity_needs_attention', [], [index], 0, {}
+        if saved:
+            if saved.get('success') is True: status = 'complete'
+            else:
+                status = 'failed'
+                recovered = (saved.get('failure_type') == 'timeout' and saved.get('resume_available') is True
+                             and any(s.get('resume_of') == step['tag'] for s in steps))
+                if not step.get('optional') and not recovered: issues.append(index)
+        elif run:
+            status = 'running' if run['status'] != 'completed' else missing_receipt_action(run, now)
+            if status == 'step_needs_attention': issues.append(index)
+            elif status == 'wait': status = 'receipt_visibility'
+        elif index in state['dispatched']:
+            status = recovery_action(state, index, step, runs, now)
+            if status == 'wait': status = 'dispatch_visibility'; reserved += 1
+            elif status == 'dispatch': status = 'ready'
+            else: issues.append(index)
+        else: status = 'ready'
+        statuses[step['tag']] = status
+    for index, step in enumerate(steps):
+        if statuses[step['tag']] != 'ready': continue
+        for dependency in step.get('after', []):
+            saved = receipts.get(dependency, {})
+            resumable = (step.get('resume_of') == dependency and saved.get('failure_type') == 'timeout'
+                         and saved.get('resume_available') is True)
+            if statuses[dependency] != 'complete' and not resumable:
+                statuses[step['tag']] = 'dependency_wait'; break
+    slots = max(0, parallel - len(active) - reserved)
+    ready = [i for i, step in enumerate(steps) if statuses[step['tag']] == 'ready'][:slots]
+    if ready: action = 'dispatch'
+    elif active or reserved or any(s in ('ready', 'running', 'receipt_visibility', 'dispatch_visibility') for s in statuses.values()):
+        action = 'wait'
+    else: action = 'step_needs_attention' if issues or 'dependency_wait' in statuses.values() else 'complete'
+    return action, ready, issues, reserved, statuses
+
+
 def run(args):
     source = sweep.Store(args.repo, args.tag)
     config = source.json_asset('line.json')
     if config is None:
         print(json.dumps({'line_ready': False})); return {'finished': True, 'action': 'not_ready'}
-    if config.get('schema') != 'box-line-1' or config.get('repo') != args.repo:
+    if config.get('schema') not in ('box-line-1', 'box-line-2') or config.get('repo') != args.repo:
         raise ValueError('Unsupported sealed line')
     steps = config['steps']
-    if not 1 <= len(steps) <= 20 or len({s['tag'] for s in steps}) != len(steps):
+    if not 1 <= len(steps) <= 64 or len({s['tag'] for s in steps}) != len(steps):
         raise ValueError('Unsupported step count')
-    for step in steps:
+    for index, step in enumerate(steps):
         sweep.identity(args.repo, step['tag'])
         if len(step['sha256']) != 64 or set(step['sha256']) - set('0123456789abcdef'):
             raise ValueError('Invalid step identity')
         if 'optional' in step and type(step['optional']) is not bool: raise ValueError('Invalid optional step')
         if step.get('resume_of') not in (None, *[s['tag'] for s in steps]): raise ValueError('Unknown resume source')
+        if config['schema'] == 'box-line-2':
+            after = step.get('after', [])
+            prior = {s['tag'] for s in steps[:index]}
+            if (not isinstance(after, list) or len(set(after)) != len(after) or set(after) - prior
+                    or (step.get('resume_of') and step['resume_of'] not in after)):
+                raise ValueError('Dependencies must reference earlier distinct checked steps')
+    parallel = config.get('max_parallel', 1)
+    if type(parallel) is not int or not 1 <= parallel <= 40:
+        raise ValueError('Unsupported parallel budget')
+    if config['schema'] == 'box-line-1' and parallel != 1: raise ValueError('Legacy line must stay serial')
     identity = hashlib.sha256(json.dumps(config, sort_keys=True).encode()).hexdigest()
     state = source.json_asset('line-state.json') or {'schema': 'box-line-state-1', 'identity': identity, 'dispatched': []}
     if state['identity'] != identity: raise ValueError('Line configuration changed')
     if state.get('finished'):
         print(json.dumps({'finished': True, 'action': state['action']})); return state
-    runs = json.loads(sweep.gh(['api', f'repos/{args.repo}/actions/workflows/probe.yml/runs?per_page=30']))['workflow_runs']
+    runs = json.loads(sweep.gh(['api', f'repos/{args.repo}/actions/workflows/probe.yml/runs?per_page=100']))['workflow_runs']
     active = [r['id'] for r in runs if r['head_branch'] == 'main' and r['status'] != 'completed']
     receipts = {}
     for step in steps:
@@ -109,8 +163,16 @@ def run(args):
                     report = report or {'bundle_sha256': step['sha256'], 'success': False, 'failure_type': 'timeout'}
                     report['resume_available'] = True
         if report: receipts[step['tag']] = report
-    action, index = next_step(steps, receipts, active)
-    if action == 'dispatch':
+    indices = None
+    if config['schema'] == 'box-line-2':
+        action, indices, issues, reserved, statuses = parallel_steps(
+            steps, receipts, runs, state, parallel, dt.datetime.now(dt.timezone.utc))
+        index = indices[0] if indices else issues[0] if issues else None
+        state.update(max_parallel=parallel, reserved_slots=reserved, step_states=statuses,
+                     needs_attention=issues, dispatch_indices=indices)
+    else:
+        action, index = next_step(steps, receipts, active)
+    if action == 'dispatch' and indices is None:
         now = dt.datetime.now(dt.timezone.utc)
         latest_run = next((r for r in runs if r['display_title'] == 'Probe ' + steps[index]['tag'] and r['head_branch'] == 'main'), None)
         if latest_run:
@@ -119,20 +181,22 @@ def run(args):
             action = recovery_action(state, index, steps[index], runs, now)
     state.update(action=action, index=index, active=active, checked_utc=sweep.now())
     state['reason'] = 'receipt_visibility' if action == 'wait' and index is not None else action
-    inputs = None
+    dispatches = []
     if action == 'dispatch':
-        if index not in state['dispatched']: state['dispatched'].append(index)
-        requests = state.setdefault('requests', {})
-        attempts = requests.get(str(index), {}).get('attempts', 0)
-        requests[str(index)] = {'requested_utc': sweep.now(), 'attempts': attempts + 1}
-        inputs = {'ref': 'main', 'inputs': {'tag': steps[index]['tag']}}
+        for index in indices if indices is not None else [index]:
+            if index not in state['dispatched']: state['dispatched'].append(index)
+            requests = state.setdefault('requests', {})
+            attempts = requests.get(str(index), {}).get('attempts', 0)
+            requests[str(index)] = {'requested_utc': sweep.now(), 'attempts': attempts + 1}
+            dispatches.append({'index': index, 'ref': 'main', 'inputs': {'tag': steps[index]['tag']}})
     state['failed_optional'] = [s['tag'] for s in steps if s.get('optional') and receipts.get(s['tag'], {}).get('success') is False]
     if action in ('complete', 'identity_needs_attention', 'step_needs_attention'):
         state['finished'] = True
     path = args.out / 'line-state.json'; sweep.save(path, state)
     sweep.gh(['release', 'upload', args.tag, str(path), '--repo', args.repo, '--clobber'])
-    if inputs:
-        path = args.out / 'dispatch.json'; sweep.save(path, inputs)
+    for inputs in dispatches:
+        name = 'dispatch.json' if indices is None else 'dispatch-' + str(inputs['index']) + '.json'
+        path = args.out / name; sweep.save(path, {k: v for k, v in inputs.items() if k != 'index'})
         sweep.gh(['api', '--method', 'POST', f'repos/{args.repo}/actions/workflows/probe.yml/dispatches', '--input', str(path)])
     if state.get('finished'):
         sweep.gh(['api', '--method', 'PUT', f'repos/{args.repo}/actions/workflows/line.yml/disable'])
