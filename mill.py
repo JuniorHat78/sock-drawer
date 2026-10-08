@@ -537,9 +537,11 @@ def probe_resume(bundle, args, key):
     report = source.json_asset('probe-receipt.json')
     if report is None:
         inventory = sweep.Store(args.repo, item['tag'])
+        report = inventory.json_asset('probe-receipt.json')
+    if report is None:
         candidates = sorted((a for a in inventory.assets.values() if re.fullmatch(r'snapshot-[0-9-]+\.json', a['name'])),
                             key=lambda a: a['created_at'])
-        report = source.json_asset(candidates[-1]['name']) if candidates else None
+        report = inventory.json_asset(candidates[-1]['name']) if candidates else None
     if not report or report.get('bundle_sha256') != item['bundle_sha256'] or len(report['outputs']) != 1:
         raise ValueError('Resume has no matching checked checkpoint')
     saved = report['outputs'][0]

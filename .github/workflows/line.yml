@@ -4,7 +4,7 @@ on:
     inputs:
       tag:
         type: string
-        default: l20261008
+        default: l20261008b
         required: false
   schedule:
     - cron: '7,22,37,52 * * * *'
@@ -40,5 +40,5 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
-          LINE_TAG: ${{ inputs.tag || 'l20261008' }}
+          LINE_TAG: ${{ inputs.tag || 'l20261008b' }}
         run: python -B line.py --repo "$REPO" --tag "$LINE_TAG" --out out --watch-seconds 19500

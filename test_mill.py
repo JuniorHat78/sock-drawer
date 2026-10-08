@@ -94,6 +94,18 @@ class Boxes(unittest.TestCase):
             with self.assertRaises(ValueError): mill.probe_resume({'resume': {'tag': 'old', 'bundle_sha256': 'expected'}}, args, self.key)
             fetch.assert_not_called()
 
+    def test_resume_uses_final_checked_asset_when_public_receipt_is_missing(self):
+        raw = self.root / 'raw'; raw.write_bytes(b'completed checked state')
+        box = self.root / 'completed.box'; mill.seal(raw, box, self.key)
+        saved = {'name': box.name, 'plain_sha256': sweep.sha(raw)}
+        receipt = {'bundle_sha256': 'expected', 'outputs': [saved]}
+        source = SimpleNamespace(json_asset=lambda name: None)
+        inventory = SimpleNamespace(json_asset=lambda name: receipt, assets={})
+        args = SimpleNamespace(repo='owner/repo', out=self.root)
+        with patch.object(mill, 'PublicSource', return_value=source), patch.object(sweep, 'Store', return_value=inventory), patch.object(mill, 'download', return_value=box):
+            result = mill.probe_resume({'resume': {'tag': 'old', 'bundle_sha256': 'expected'}}, args, self.key)
+        self.assertEqual(result.read_bytes(), raw.read_bytes())
+
     def test_tamper_never_commits_plaintext(self):
         raw = self.root / 'raw'; raw.write_bytes(b'checked content' * 100)
         box, decoded = self.root / 'a.box', self.root / 'decoded'
