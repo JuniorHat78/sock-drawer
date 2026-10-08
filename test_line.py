@@ -9,6 +9,34 @@ import line
 
 
 class LineTests(unittest.TestCase):
+    def test_large_dispatch_wave_records_all_intents_before_requests_and_keeps_dependencies_waiting(self):
+        steps = [{'tag': 'q0', 'sha256': 'a' * 64},
+                 {'tag': 'q1', 'sha256': 'b' * 64, 'after': ['q0']}]
+        steps += [{'tag': 'q' + str(i), 'sha256': 'c' * 64} for i in range(2, 34)]
+        config = {'schema': 'box-line-2', 'repo': 'a/b', 'max_parallel': 38, 'steps': steps}
+        run = {'id': 1, 'display_title': 'Probe q0', 'head_branch': 'main',
+               'status': 'in_progress', 'conclusion': None}
+        source = Mock(); source.json_asset.side_effect = lambda name: config if name == 'line.json' else None
+        def reader(repo, tag, scratch):
+            result = Mock()
+            result.json_asset.side_effect = lambda name: {'bundle': {'sha256': next(s['sha256'] for s in steps if s['tag'] == tag)}} if name == 'probe.json' else None
+            return result
+        saved = []
+        def gh(values):
+            if values[0] == 'api' and '/runs?' in values[1]: return json.dumps({'workflow_runs': [run]}).encode()
+            if values[:2] == ['release', 'upload']:
+                saved.append(json.loads(Path(values[3]).read_text()))
+            if '/dispatches' in str(values):
+                self.assertEqual(len(saved[-1]['requests']), 32)
+                self.assertEqual(len(saved[-1]['dispatched']), 32)
+            return b''
+        with tempfile.TemporaryDirectory(dir=Path(__file__).resolve().parent) as temporary:
+            with patch.object(line.sweep, 'Store', return_value=source), patch.object(line.mill, 'PublicSource', side_effect=reader), patch.object(line.sweep, 'gh', side_effect=gh) as requests:
+                state = line.run(SimpleNamespace(repo='a/b', tag='line', out=Path(temporary)))
+        self.assertEqual(state['step_states']['q1'], 'dependency_wait')
+        self.assertEqual(state['dispatch_indices'], list(range(2, 34)))
+        self.assertEqual(sum('/dispatches' in str(call) for call in requests.call_args_list), 32)
+
     def parallel_fixture(self):
         now = dt.datetime(2026, 10, 8, 3, tzinfo=dt.timezone.utc)
         steps = [{'tag': 'a', 'sha256': 'x'}, {'tag': 'b', 'sha256': 'y', 'after': ['a']},

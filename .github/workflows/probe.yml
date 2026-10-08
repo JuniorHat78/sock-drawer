@@ -59,9 +59,9 @@ jobs:
           OPENBLAS_NUM_THREADS: 1
           OMP_NUM_THREADS: 1
         run: python -B mill.py probe --repo "$REPO" --tag "$TAG" --out out
-      - name: Wake serial check
+      - name: Wake queued checks
         if: ${{ always() }}
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
-        run: python -B line.py --repo "$REPO" --tag l20261008d --out out --wake
+        run: python -B line.py --repo "$REPO" --tag l20261008e --out out --wake
