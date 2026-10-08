@@ -47,6 +47,23 @@ def recovery_action(state, index, step, runs, now):
     return 'step_needs_attention'
 
 
+def missing_receipt_action(run, now):
+    """A completed job may precede the visibility of its sealed receipt."""
+    if run['status'] != 'completed': return 'wait'
+    completed = dt.datetime.fromisoformat(run['updated_at'].replace('Z', '+00:00'))
+    if (now - completed).total_seconds() < 600: return 'wait'
+    return 'step_needs_attention'
+
+
+def read_receipt(repo, tag, reader, latest_run):
+    report = reader.json_asset('probe-receipt.json')
+    if report is None and latest_run and latest_run['status'] == 'completed':
+        # Public download URLs can retain a negative response after publication.
+        # Read by asset ID, with its server size and digest, before declaring loss.
+        report = sweep.Store(repo, tag).json_asset('probe-receipt.json')
+    return report
+
+
 def run(args):
     source = sweep.Store(args.repo, args.tag)
     config = source.json_asset('line.json')
@@ -74,10 +91,12 @@ def run(args):
     for step in steps:
         reader = mill.PublicSource(args.repo, step['tag'], args.out / 'metadata')
         control = reader.json_asset('probe.json')
+        if control is None:
+            control = sweep.Store(args.repo, step['tag']).json_asset('probe.json')
         if not control or control['bundle']['sha256'] != step['sha256']:
             raise ValueError('Step has no matching frozen program')
-        report = reader.json_asset('probe-receipt.json')
         latest_run = next((r for r in runs if r['display_title'] == 'Probe ' + step['tag'] and r['head_branch'] == 'main'), None)
+        report = read_receipt(args.repo, step['tag'], reader, latest_run)
         if (report and report.get('failure_type') == 'timeout') or (report is None and latest_run and latest_run['conclusion'] == 'timed_out'):
             inventory = sweep.Store(args.repo, step['tag'])
             snapshots = sorted((a for a in inventory.assets.values() if a['name'].startswith('snapshot-') and a['name'].endswith('.json')),
@@ -91,9 +110,15 @@ def run(args):
                     report['resume_available'] = True
         if report: receipts[step['tag']] = report
     action, index = next_step(steps, receipts, active)
-    if action == 'dispatch' and index in state['dispatched']:
-        action = recovery_action(state, index, steps[index], runs, dt.datetime.now(dt.timezone.utc))
+    if action == 'dispatch':
+        now = dt.datetime.now(dt.timezone.utc)
+        latest_run = next((r for r in runs if r['display_title'] == 'Probe ' + steps[index]['tag'] and r['head_branch'] == 'main'), None)
+        if latest_run:
+            action = missing_receipt_action(latest_run, now)
+        elif index in state['dispatched']:
+            action = recovery_action(state, index, steps[index], runs, now)
     state.update(action=action, index=index, active=active, checked_utc=sweep.now())
+    state['reason'] = 'receipt_visibility' if action == 'wait' and index is not None else action
     inputs = None
     if action == 'dispatch':
         if index not in state['dispatched']: state['dispatched'].append(index)
@@ -119,7 +144,7 @@ def wake(args):
     workflow = json.loads(sweep.gh(['api', f'repos/{args.repo}/actions/workflows/line.yml']))
     if workflow['state'] != 'active':
         print(json.dumps({'controller_wake': False, 'reason': 'disabled'})); return
-    path = args.out / 'wake.json'; sweep.save(path, {'ref': 'main'})
+    path = args.out / 'wake.json'; sweep.save(path, {'ref': 'main', 'inputs': {'tag': args.tag}})
     sweep.gh(['api', '--method', 'POST', f'repos/{args.repo}/actions/workflows/line.yml/dispatches', '--input', str(path)])
     print(json.dumps({'controller_wake': True}), flush=True)
 

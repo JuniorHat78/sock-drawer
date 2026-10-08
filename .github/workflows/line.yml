@@ -1,6 +1,11 @@
 name: Line
 on:
   workflow_dispatch:
+    inputs:
+      tag:
+        type: string
+        default: l20261008
+        required: false
   schedule:
     - cron: '7,22,37,52 * * * *'
   workflow_run:
@@ -35,4 +40,5 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
-        run: python -B line.py --repo "$REPO" --tag l20261007 --out out --watch-seconds 19500
+          LINE_TAG: ${{ inputs.tag || 'l20261008' }}
+        run: python -B line.py --repo "$REPO" --tag "$LINE_TAG" --out out --watch-seconds 19500

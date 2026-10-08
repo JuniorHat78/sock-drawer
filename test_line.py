@@ -1,7 +1,10 @@
 import unittest
 import datetime as dt
+import json
+from pathlib import Path
+import tempfile
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 import line
 
 
@@ -27,6 +30,66 @@ class LineTests(unittest.TestCase):
 
     def test_no_parallel_steps(self):
         self.assertEqual(line.next_step([{'tag': 'a', 'sha256': 'x'}], {}, [4]), ('wait', None))
+
+    def test_completed_job_waits_for_its_receipt_without_redispatch(self):
+        now = dt.datetime(2026, 10, 8, 1, tzinfo=dt.timezone.utc)
+        run = {'status': 'completed', 'updated_at': (now - dt.timedelta(seconds=15)).isoformat()}
+        self.assertEqual(line.missing_receipt_action(run, now), 'wait')
+        self.assertEqual(line.missing_receipt_action(run, now + dt.timedelta(minutes=11)), 'step_needs_attention')
+        run['status'] = 'in_progress'
+        self.assertEqual(line.missing_receipt_action(run, now), 'wait')
+
+    def test_public_missing_receipt_is_rechecked_by_verified_asset_id(self):
+        report = {'success': True, 'bundle_sha256': 'x'}
+        with patch.object(line.mill, 'PublicSource') as reader, patch.object(line.sweep, 'Store') as store:
+            reader.json_asset.return_value = None
+            store.return_value.json_asset.return_value = report
+            self.assertEqual(line.read_receipt('a/b', 'c', reader, {'status': 'completed'}), report)
+            store.assert_called_once_with('a/b', 'c')
+            store.return_value.json_asset.assert_called_once_with('probe-receipt.json')
+
+    def test_active_job_does_not_poll_authenticated_receipt_metadata(self):
+        with patch.object(line.mill, 'PublicSource') as reader, patch.object(line.sweep, 'Store') as store:
+            reader.json_asset.return_value = None
+            self.assertIsNone(line.read_receipt('a/b', 'c', reader, {'status': 'in_progress'}))
+            store.assert_not_called()
+
+    def completed_handoff(self, authenticated_report):
+        now = dt.datetime.now(dt.timezone.utc)
+        steps = [{'tag': 'q1', 'sha256': 'a' * 64}, {'tag': 'q2', 'sha256': 'b' * 64}]
+        config = {'schema': 'box-line-1', 'repo': 'a/b', 'steps': steps}
+        completed = {'id': 10, 'display_title': 'Probe q1', 'head_branch': 'main',
+                     'status': 'completed', 'conclusion': 'success',
+                     'updated_at': (now - dt.timedelta(seconds=15)).isoformat()}
+        source = Mock()
+        source.json_asset.side_effect = lambda name: config if name == 'line.json' else None
+        receipt_store = Mock()
+        receipt_store.json_asset.return_value = authenticated_report
+        def store(repo, tag): return source if tag == 'line' else receipt_store
+        def reader(repo, tag, scratch):
+            result = Mock()
+            result.json_asset.side_effect = lambda name: {'bundle': {'sha256': next(s['sha256'] for s in steps if s['tag'] == tag)}} if name == 'probe.json' else None
+            return result
+        def gh(values):
+            return json.dumps({'workflow_runs': [completed]}).encode() if values[0] == 'api' and '/runs?' in values[1] else b''
+        with tempfile.TemporaryDirectory(dir=Path(__file__).resolve().parent) as temporary, patch.object(line.sweep, 'Store', side_effect=store), patch.object(line.mill, 'PublicSource', side_effect=reader), patch.object(line.sweep, 'gh', side_effect=gh) as request:
+            state = line.run(SimpleNamespace(repo='a/b', tag='line', out=Path(temporary)))
+        return state, request.call_args_list
+
+    def test_completed_handoff_advances_when_public_receipt_is_stale(self):
+        state, requests = self.completed_handoff({'success': True, 'bundle_sha256': 'a' * 64})
+        self.assertEqual(state['action'], 'dispatch')
+        self.assertEqual(state['index'], 1)
+        self.assertFalse(state.get('finished', False))
+        self.assertEqual(sum('/dispatches' in str(call) for call in requests), 1)
+        self.assertFalse(any('/disable' in str(call) for call in requests))
+
+    def test_completed_handoff_waits_when_both_receipt_reads_are_missing(self):
+        state, requests = self.completed_handoff(None)
+        self.assertEqual(state['action'], 'wait')
+        self.assertEqual(state['reason'], 'receipt_visibility')
+        self.assertFalse(state.get('finished', False))
+        self.assertFalse(any('/dispatches' in str(call) or '/disable' in str(call) for call in requests))
 
     def test_successful_steps_are_not_repeated(self):
         steps = [{'tag': 'a', 'sha256': 'x'}, {'tag': 'b', 'sha256': 'y'}]

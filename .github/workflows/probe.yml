@@ -63,4 +63,4 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
-        run: python -B line.py --repo "$REPO" --tag l20261007 --out out --wake
+        run: python -B line.py --repo "$REPO" --tag l20261008 --out out --wake
