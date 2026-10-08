@@ -49,6 +49,7 @@ jobs:
         with:
           python-version: '3.13'
       - run: python -m pip install --disable-pip-version-check cryptography==42.0.8
+      - run: python -B -m unittest -v test_mill
       - name: Check sealed experiment
         env:
           GH_TOKEN: ${{ github.token }}
@@ -63,4 +64,4 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
-        run: python -B line.py --repo "$REPO" --tag l20261008b --out out --wake
+        run: python -B line.py --repo "$REPO" --tag l20261008c --out out --wake

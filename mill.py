@@ -9,6 +9,7 @@ import os
 from pathlib import Path, PurePosixPath
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import tarfile
@@ -582,11 +583,29 @@ def probe_resources(pid, result_dir):
             'workspace_free_bytes': shutil.disk_usage(result_dir).free}
 
 
+def stop_probe(process):
+    """Close only the child session, including descendants after its leader exits."""
+    if os.name == 'posix':
+        try: os.killpg(process.pid, signal.SIGTERM)
+        except ProcessLookupError: pass
+        try: process.wait(timeout=20)
+        except subprocess.TimeoutExpired: pass
+        finally:
+            try: os.killpg(process.pid, getattr(signal, 'SIGKILL', 9))
+            except ProcessLookupError: pass
+        process.wait(timeout=20)
+    elif process.poll() is None:
+        process.terminate()
+        try: process.wait(timeout=20)
+        except subprocess.TimeoutExpired: process.kill(); process.wait(timeout=20)
+
+
 def probe_process(command, runtime, result_dir, store, key, limit, bundle_sha):
     began = time.monotonic(); last_snapshot = began; index = 0
     last_resource = began - 60
     with (result_dir / 'experiment.log').open('wb') as log:
-        process = subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT, env=child_environment())
+        process = subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT,
+                                   env=child_environment(), start_new_session=os.name == 'posix')
         try:
             while process.poll() is None:
                 elapsed = time.monotonic() - began
@@ -612,10 +631,7 @@ def probe_process(command, runtime, result_dir, store, key, limit, bundle_sha):
                 time.sleep(2)
             return process.returncode == 0
         finally:
-            if process.poll() is None:
-                process.terminate()
-                try: process.wait(timeout=20)
-                except subprocess.TimeoutExpired: process.kill(); process.wait(timeout=20)
+            stop_probe(process)
 
 
 def probe(args):

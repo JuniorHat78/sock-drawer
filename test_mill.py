@@ -3,9 +3,10 @@ import json
 import os
 from pathlib import Path
 import shutil
+import signal
 import tarfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import patch, Mock, call
 import uuid
 from types import SimpleNamespace
 
@@ -32,6 +33,22 @@ class Boxes(unittest.TestCase):
         self.assertNotEqual(first.read_bytes(), second.read_bytes())
         mill.unseal(first, decoded, self.key)
         self.assertEqual(sweep.sha(raw), sweep.sha(decoded))
+
+    def test_stop_closes_descendants_even_after_the_leader_exits(self):
+        process = Mock(pid=12345)
+        process.poll.return_value = 0
+        with patch.object(mill.os, 'name', 'posix'), patch.object(mill.os, 'killpg', create=True) as kill:
+            mill.stop_probe(process)
+        self.assertEqual(kill.call_args_list, [call(12345, signal.SIGTERM), call(12345, 9)])
+        process.terminate.assert_not_called()
+
+    def test_stop_escalates_an_unresponsive_child_session(self):
+        process = Mock(pid=12345)
+        process.wait.side_effect = [mill.subprocess.TimeoutExpired('child', 20), 0]
+        with patch.object(mill.os, 'name', 'posix'), patch.object(mill.os, 'killpg', create=True) as kill:
+            mill.stop_probe(process)
+        self.assertEqual(kill.call_args_list[-1], call(12345, 9))
+        self.assertEqual(process.wait.call_count, 2)
 
     def test_completed_probe_checks_digest_without_repeating_work(self):
         saved = {'name': 'probe-result.box', 'bytes': 42, 'sha256': 'a' * 64}
